@@ -1,0 +1,3 @@
+# Reproducible-build flags; flashbots-images' build_rust_package merges these.
+[build]
+rustflags = ["-C", "target-cpu=generic", "-C", "link-arg=-Wl,--build-id=none", "-C", "symbol-mangling-version=v0"]

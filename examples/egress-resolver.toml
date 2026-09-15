@@ -1,0 +1,53 @@
+# Example configuration (the flashbox-l1 image ships the authoritative copy at
+# /etc/bob/egress-resolver.toml).
+
+[resolver]
+# Recursive resolvers tried in order; the answer must carry the AD bit.
+servers = ["1.1.1.1", "1.0.0.1"]
+# TLS server name the resolver certificate must be valid for.
+server_name = "cloudflare-dns.com"
+port = 853
+timeout_secs = 5
+attempts = 3
+require_authenticated = true
+
+[firewall]
+# Both chains are created empty by firewall-config and jumped to from
+# PRODUCTION_OUT / MAINTENANCE_OUT respectively.
+production_chain = "DYN_BNET_PRODUCTION_OUT"
+maintenance_chain = "DYN_BNET_MAINTENANCE_OUT"
+port = 443
+max_addresses = 64
+
+# BuilderNet public names (per-node names such as fb-*.nodes.buildernet.org are
+# not a client contract and are intentionally absent).
+[[endpoint]]
+name = "rpc.buildernet.org"
+required = true
+
+[[endpoint]]
+name = "direct-us.buildernet.org"
+
+[[endpoint]]
+name = "direct-eu.buildernet.org"
+
+[[endpoint]]
+name = "direct-ap.buildernet.org"
+
+# Static entries copied into the container hosts file (their firewall rules are
+# static too, in firewall-config).
+[[static_host]]
+ip = "3.149.14.12"
+names = ["tx.tee-searcher.flashbots.net"]
+
+[[static_host]]
+ip = "3.136.107.142"
+names = ["tx.tee-searcher.flashbots.net"]
+
+[[static_host]]
+ip = "18.221.59.61"
+names = ["backruns.tee-searcher.flashbots.net"]
+
+[[static_host]]
+ip = "3.15.88.156"
+names = ["backruns.tee-searcher.flashbots.net"]
