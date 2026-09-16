@@ -29,7 +29,11 @@ impl Exec for SystemExec {
     fn run(&mut self, program: &str, args: &[&str], stdin: Option<&str>) -> io::Result<Output> {
         let mut cmd = Command::new(program);
         cmd.args(args)
-            .stdin(if stdin.is_some() { Stdio::piped() } else { Stdio::null() })
+            .stdin(if stdin.is_some() {
+                Stdio::piped()
+            } else {
+                Stdio::null()
+            })
             .stdout(Stdio::piped())
             .stderr(Stdio::piped())
             .env_clear()

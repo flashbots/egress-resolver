@@ -93,7 +93,8 @@ pub fn lock_exclusive(path: &Path, timeout: Duration) -> io::Result<FlockGuard> 
             return Ok(FlockGuard { _file: file });
         }
         let err = io::Error::last_os_error();
-        if err.raw_os_error() != Some(libc::EWOULDBLOCK) && err.raw_os_error() != Some(libc::EINTR) {
+        if err.raw_os_error() != Some(libc::EWOULDBLOCK) && err.raw_os_error() != Some(libc::EINTR)
+        {
             return Err(err);
         }
         if Instant::now() >= deadline {
@@ -118,8 +119,14 @@ mod tests {
         write_atomic(&p, "one\n", 0o644).unwrap();
         write_atomic(&p, "two\n", 0o644).unwrap();
         assert_eq!(fs::read_to_string(&p).unwrap(), "two\n");
-        assert_eq!(fs::metadata(&p).unwrap().permissions().mode() & 0o777, 0o644);
-        assert!(fs::read_dir(&dir).unwrap().count() == 1, "no temp file left behind");
+        assert_eq!(
+            fs::metadata(&p).unwrap().permissions().mode() & 0o777,
+            0o644
+        );
+        assert!(
+            fs::read_dir(&dir).unwrap().count() == 1,
+            "no temp file left behind"
+        );
         fs::remove_dir_all(&dir).unwrap();
     }
 

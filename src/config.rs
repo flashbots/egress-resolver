@@ -42,6 +42,10 @@ pub struct ResolverConfig {
     /// Attempts per name per server before moving on.
     #[serde(default = "default_attempts")]
     pub attempts: u32,
+    /// Overall wall-clock budget for one `resolve` run. Names still unsettled
+    /// when it expires are reported as transient so `apply` always runs.
+    #[serde(default = "default_deadline_secs")]
+    pub deadline_secs: u64,
     /// Require the AD (authenticated data) bit, i.e. the resolver's DNSSEC
     /// validation, on every accepted answer.
     #[serde(default = "default_true")]
@@ -92,6 +96,14 @@ fn default_timeout_secs() -> u64 {
 fn default_attempts() -> u32 {
     3
 }
+fn default_deadline_secs() -> u64 {
+    30
+}
+
+/// iptables limits a rule comment to 256 bytes including the terminator. Rule
+/// comments carry the hostnames an address was resolved from (the per-name
+/// last-known-good state), so the joined endpoint names must always fit.
+pub const MAX_COMMENT_LEN: usize = 255;
 fn default_true() -> bool {
     true
 }
@@ -121,7 +133,8 @@ impl Config {
     }
 
     pub fn parse(text: &str) -> Result<Self, ConfigError> {
-        let cfg: Config = toml::from_str(text).map_err(|e| ConfigError(format!("invalid config: {e}")))?;
+        let cfg: Config =
+            toml::from_str(text).map_err(|e| ConfigError(format!("invalid config: {e}")))?;
         cfg.validate()?;
         Ok(cfg)
     }
@@ -139,13 +152,19 @@ impl Config {
         if self.resolver.timeout_secs == 0 {
             return Err(ConfigError("resolver.timeout_secs must be >= 1".into()));
         }
+        if self.resolver.deadline_secs == 0 {
+            return Err(ConfigError("resolver.deadline_secs must be >= 1".into()));
+        }
         if self.endpoints.is_empty() {
             return Err(ConfigError("at least one [[endpoint]] is required".into()));
         }
         if self.firewall.production_chain == self.firewall.maintenance_chain {
             return Err(ConfigError("firewall chains must differ".into()));
         }
-        for chain in [&self.firewall.production_chain, &self.firewall.maintenance_chain] {
+        for chain in [
+            &self.firewall.production_chain,
+            &self.firewall.maintenance_chain,
+        ] {
             if !is_chain_name(chain) {
                 return Err(ConfigError(format!("invalid chain name {chain:?}")));
             }
@@ -163,6 +182,14 @@ impl Config {
                 return Err(ConfigError(format!("duplicate endpoint {:?}", ep.name)));
             }
         }
+        // Worst case: one address shared by every endpoint name.
+        let joined: usize =
+            seen.iter().map(|n| n.len()).sum::<usize>() + seen.len().saturating_sub(1);
+        if joined > MAX_COMMENT_LEN {
+            return Err(ConfigError(format!(
+                "endpoint names joined ({joined} bytes) exceed the {MAX_COMMENT_LEN}-byte iptables comment limit; provenance would be lost"
+            )));
+        }
         for sh in &self.static_hosts {
             if sh.names.is_empty() {
                 return Err(ConfigError(format!("static_host {} has no names", sh.ip)));
@@ -178,7 +205,20 @@ impl Config {
 
     /// Endpoint names, normalized (lower-case, no trailing dot), in config order.
     pub fn endpoint_names(&self) -> Vec<String> {
-        self.endpoints.iter().map(|e| normalize_name(&e.name)).collect()
+        self.endpoints
+            .iter()
+            .map(|e| normalize_name(&e.name))
+            .collect()
+    }
+
+    /// Resolver addresses as a comma-separated list, for `firewall-config`.
+    pub fn servers_csv(&self) -> String {
+        self.resolver
+            .servers
+            .iter()
+            .map(|s| s.to_string())
+            .collect::<Vec<_>>()
+            .join(",")
     }
 }
 
@@ -247,7 +287,9 @@ names = ["tx.tee-searcher.flashbots.net"]
         assert_eq!(cfg.resolver.port, 853);
         assert_eq!(cfg.resolver.timeout_secs, 5);
         assert_eq!(cfg.resolver.attempts, 3);
+        assert_eq!(cfg.resolver.deadline_secs, 30);
         assert!(cfg.resolver.require_authenticated);
+        assert_eq!(cfg.servers_csv(), "1.1.1.1,1.0.0.1");
         assert_eq!(cfg.firewall.port, 443);
         assert_eq!(cfg.firewall.max_addresses, 64);
         assert_eq!(
@@ -283,6 +325,19 @@ names = ["tx.tee-searcher.flashbots.net"]
         assert!(Config::parse(&bad).is_err());
         let bad = SAMPLE.replace("DYN_BNET_MAINTENANCE_OUT", "DYN_BNET_PRODUCTION_OUT");
         assert!(Config::parse(&bad).is_err());
+    }
+
+    #[test]
+    fn rejects_names_that_cannot_fit_a_rule_comment() {
+        let mut many = SAMPLE.to_string();
+        for i in 0..5 {
+            many.push_str(&format!(
+                "\n[[endpoint]]\nname = \"{}{i}.buildernet.org\"\n",
+                "x".repeat(50)
+            ));
+        }
+        let err = Config::parse(&many).unwrap_err().to_string();
+        assert!(err.contains("comment limit"), "{err}");
     }
 
     #[test]

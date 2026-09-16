@@ -27,20 +27,17 @@ pub fn kill_set(mode: &str, production: &AddrMap, maintenance: &AddrMap) -> Vec<
         .collect()
 }
 
-/// Delete conntrack entries for TCP flows to each `ip:port`.
+/// Delete every conntrack entry whose destination is one of `ips`.
 ///
-/// Returns the addresses whose deletion command failed. `conntrack -D` exits 1
-/// when nothing matched, which is not a failure here.
-pub fn kill(exec: &mut dyn Exec, port: u16, ips: &[Ipv4Addr]) -> Vec<(Ipv4Addr, String)> {
-    let port = port.to_string();
+/// Destination-only, like `toggle`'s own teardown: the maintenance drop rules
+/// are port-agnostic, so the sweep must be too. Returns the addresses whose
+/// deletion command failed. `conntrack -D` exits 1 when nothing matched, which
+/// is not a failure here.
+pub fn kill(exec: &mut dyn Exec, ips: &[Ipv4Addr]) -> Vec<(Ipv4Addr, String)> {
     let mut failed = Vec::new();
     for ip in ips {
         let dst = ip.to_string();
-        match exec.run(
-            CONNTRACK,
-            &["-D", "-p", "tcp", "-d", &dst, "--dport", &port],
-            None,
-        ) {
+        match exec.run(CONNTRACK, &["-D", "-d", &dst], None) {
             Ok(out) if out.status == 0 || out.status == 1 => {}
             Ok(out) => failed.push((*ip, format!("status {}: {}", out.status, out.stderr.trim()))),
             Err(e) => failed.push((*ip, e.to_string())),
@@ -67,7 +64,10 @@ mod tests {
     fn production_kills_only_retired_addresses() {
         let prod = map(&["200.225.47.181", "35.213.62.127"]);
         let maint = map(&["200.225.47.181", "35.213.62.127", "198.203.203.37"]);
-        assert_eq!(kill_set("production", &prod, &maint), vec![ip("198.203.203.37")]);
+        assert_eq!(
+            kill_set("production", &prod, &maint),
+            vec![ip("198.203.203.37")]
+        );
     }
 
     #[test]
@@ -81,21 +81,20 @@ mod tests {
     }
 
     #[test]
-    fn kill_runs_one_scoped_delete_per_address_and_tolerates_no_match() {
-        let mut ex = FakeExec::default().respond(1, "0 flow entries have been deleted.").respond(0, "");
-        let failed = kill(&mut ex, 443, &[ip("1.1.1.1"), ip("2.2.2.2")]);
+    fn kill_runs_one_destination_delete_per_address_and_tolerates_no_match() {
+        let mut ex = FakeExec::default()
+            .respond(1, "0 flow entries have been deleted.")
+            .respond(0, "");
+        let failed = kill(&mut ex, &[ip("1.1.1.1"), ip("2.2.2.2")]);
         assert!(failed.is_empty());
         assert_eq!(ex.calls.len(), 2);
-        assert_eq!(
-            ex.calls[0].args,
-            vec!["-D", "-p", "tcp", "-d", "1.1.1.1", "--dport", "443"]
-        );
+        assert_eq!(ex.calls[0].args, vec!["-D", "-d", "1.1.1.1"]);
     }
 
     #[test]
     fn kill_reports_real_failures() {
         let mut ex = FakeExec::default().respond(2, "");
-        let failed = kill(&mut ex, 443, &[ip("1.1.1.1")]);
+        let failed = kill(&mut ex, &[ip("1.1.1.1")]);
         assert_eq!(failed.len(), 1);
         assert_eq!(failed[0].0, ip("1.1.1.1"));
     }

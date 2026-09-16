@@ -56,14 +56,44 @@ pub struct Plan {
     pub error: Option<String>,
 }
 
-impl Plan {
-    /// True when every `required` endpoint has at least one address.
-    pub fn required_satisfied(&self) -> bool {
-        self.names
-            .iter()
-            .filter(|n| n.required)
-            .all(|n| !n.addrs.is_empty())
-    }
+/// True when every `required` endpoint has at least one address.
+pub fn required_satisfied(names: &[NameState]) -> bool {
+    names
+        .iter()
+        .filter(|n| n.required)
+        .all(|n| !n.addrs.is_empty())
+}
+
+/// True when every `required` endpoint's addresses come from a fresh
+/// authenticated answer in this run (not last-known-good).
+pub fn required_fresh(names: &[NameState]) -> bool {
+    names
+        .iter()
+        .filter(|n| n.required)
+        .all(|n| n.source == Source::Fresh)
+}
+
+/// Per-name state reconstructed from the kernel's production chain: what the
+/// firewall actually enforces right now, with `error` as the reason no fresh
+/// answer was applied. Used whenever the new plan cannot be installed.
+pub fn names_from_kernel(
+    cfg: &Config,
+    current_production: &[RuleEntry],
+    error: &str,
+) -> Vec<NameState> {
+    let map = entries_to_map(current_production);
+    cfg.endpoints
+        .iter()
+        .zip(cfg.endpoint_names())
+        .map(|(ep, name)| {
+            let previous: Vec<Ipv4Addr> = map
+                .iter()
+                .filter(|(_, ns)| ns.contains(&name))
+                .map(|(ip, _)| *ip)
+                .collect();
+            lkg(&name, ep.required, previous, error.to_string())
+        })
+        .collect()
 }
 
 pub fn compute(
@@ -90,7 +120,12 @@ pub fn compute(
                     .filter(|ip| !is_global_unicast(**ip))
                     .collect();
                 if r.addrs.is_empty() {
-                    lkg(&name, ep.required, previous, "ok outcome without addresses".into())
+                    lkg(
+                        &name,
+                        ep.required,
+                        previous,
+                        "ok outcome without addresses".into(),
+                    )
                 } else if !invalid.is_empty() {
                     lkg(
                         &name,
@@ -128,7 +163,9 @@ pub fn compute(
                 &name,
                 ep.required,
                 previous,
-                r.error.clone().unwrap_or_else(|| "transient failure".into()),
+                r.error
+                    .clone()
+                    .unwrap_or_else(|| "transient failure".into()),
             ),
             None => lkg(&name, ep.required, previous, "no result for name".into()),
         };
@@ -144,17 +181,25 @@ pub fn compute(
 
     let mut error = None;
     if production.len() > cfg.firewall.max_addresses {
-        error = Some(format!(
+        let msg = format!(
             "resolved {} addresses, more than max_addresses={}; keeping previous chain",
             production.len(),
             cfg.firewall.max_addresses
-        ));
+        );
+        // The previous chain stays installed, so every consumer of the plan
+        // (hosts file, readiness, status) must describe that chain, not the
+        // rejected candidate.
+        names = names_from_kernel(cfg, current_production, &msg);
         production = current_prod_map.clone();
+        error = Some(msg);
     }
 
     let mut maintenance = entries_to_map(current_maintenance);
     for (ip, ns) in &production {
-        maintenance.entry(*ip).or_default().extend(ns.iter().cloned());
+        maintenance
+            .entry(*ip)
+            .or_default()
+            .extend(ns.iter().cloned());
     }
 
     let added = production
@@ -277,7 +322,10 @@ name = "direct-ap.buildernet.org"
     fn fresh_answers_build_union_and_maintenance_grows() {
         let a = answers(vec![
             ok("rpc.buildernet.org", &["200.225.47.181", "200.225.47.183"]),
-            ok("direct-us.buildernet.org", &["200.225.47.181", "200.225.47.183"]),
+            ok(
+                "direct-us.buildernet.org",
+                &["200.225.47.181", "200.225.47.183"],
+            ),
             ok("direct-ap.buildernet.org", &["35.213.62.127"]),
         ]);
         let current_maint = vec![entry("198.203.203.37", &["direct-ap.buildernet.org"])];
@@ -296,14 +344,17 @@ name = "direct-ap.buildernet.org"
         assert!(p.maintenance.contains_key(&ip("198.203.203.37")));
         assert_eq!(p.added.len(), 3);
         assert!(p.removed.is_empty());
-        assert!(p.required_satisfied());
+        assert!(required_satisfied(&p.names));
         assert!(p.names.iter().all(|n| n.source == Source::Fresh));
     }
 
     #[test]
     fn transient_failure_keeps_last_known_good_per_name() {
         let current_prod = vec![
-            entry("200.225.47.181", &["rpc.buildernet.org", "direct-us.buildernet.org"]),
+            entry(
+                "200.225.47.181",
+                &["rpc.buildernet.org", "direct-us.buildernet.org"],
+            ),
             entry("34.104.157.101", &["direct-ap.buildernet.org"]),
         ];
         let a = answers(vec![
@@ -312,7 +363,11 @@ name = "direct-ap.buildernet.org"
             transient("direct-ap.buildernet.org"),
         ]);
         let p = compute(&cfg(), &a, &current_prod, &current_prod);
-        let ap = p.names.iter().find(|n| n.name == "direct-ap.buildernet.org").unwrap();
+        let ap = p
+            .names
+            .iter()
+            .find(|n| n.name == "direct-ap.buildernet.org")
+            .unwrap();
         assert_eq!(ap.source, Source::LastKnownGood);
         assert_eq!(ap.addrs, vec![ip("34.104.157.101")]);
         assert!(p.production.contains_key(&ip("34.104.157.101")));
@@ -327,16 +382,26 @@ name = "direct-ap.buildernet.org"
             ok("direct-ap.buildernet.org", &["35.213.62.127"]),
         ]);
         let p = compute(&cfg(), &a, &[], &[]);
-        let rpc = p.names.iter().find(|n| n.name == "rpc.buildernet.org").unwrap();
+        let rpc = p
+            .names
+            .iter()
+            .find(|n| n.name == "rpc.buildernet.org")
+            .unwrap();
         assert_eq!(rpc.source, Source::Missing);
-        assert!(!p.required_satisfied(), "rpc is required and has no address");
+        assert!(
+            !required_satisfied(&p.names),
+            "rpc is required and has no address"
+        );
         assert_eq!(p.production.len(), 2);
     }
 
     #[test]
     fn authenticated_negative_clears_name_and_removes_ip() {
         let current_prod = vec![
-            entry("200.225.47.181", &["rpc.buildernet.org", "direct-us.buildernet.org"]),
+            entry(
+                "200.225.47.181",
+                &["rpc.buildernet.org", "direct-us.buildernet.org"],
+            ),
             entry("198.203.203.37", &["direct-ap.buildernet.org"]),
         ];
         let a = answers(vec![
@@ -345,7 +410,11 @@ name = "direct-ap.buildernet.org"
             empty("direct-ap.buildernet.org"),
         ]);
         let p = compute(&cfg(), &a, &current_prod, &current_prod);
-        let ap = p.names.iter().find(|n| n.name == "direct-ap.buildernet.org").unwrap();
+        let ap = p
+            .names
+            .iter()
+            .find(|n| n.name == "direct-ap.buildernet.org")
+            .unwrap();
         assert_eq!(ap.source, Source::Empty);
         assert!(ap.addrs.is_empty());
         assert_eq!(p.removed, vec![ip("198.203.203.37")]);
@@ -375,14 +444,18 @@ name = "direct-ap.buildernet.org"
             ok("direct-ap.buildernet.org", &["35.213.62.127"]),
         ]);
         let p = compute(&cfg(), &a, &current_prod, &current_prod);
-        let rpc = p.names.iter().find(|n| n.name == "rpc.buildernet.org").unwrap();
+        let rpc = p
+            .names
+            .iter()
+            .find(|n| n.name == "rpc.buildernet.org")
+            .unwrap();
         assert_eq!(rpc.source, Source::LastKnownGood);
         assert_eq!(rpc.addrs, vec![ip("200.225.47.181")]);
         assert!(!p.production.contains_key(&ip("169.254.169.254")));
     }
 
     #[test]
-    fn exceeding_max_addresses_keeps_previous_chain() {
+    fn exceeding_max_addresses_keeps_previous_chain_and_previous_names() {
         let current_prod = vec![entry("200.225.47.181", &["rpc.buildernet.org"])];
         let a = answers(vec![
             ok("rpc.buildernet.org", &["1.1.1.1", "1.1.1.2", "1.1.1.3"]),
@@ -393,13 +466,56 @@ name = "direct-ap.buildernet.org"
         assert!(p.error.is_some());
         assert_eq!(p.production, entries_to_map(&current_prod));
         assert!(p.added.is_empty() && p.removed.is_empty());
+        // hosts/readiness must describe the installed chain, not the candidate
+        let rpc = p
+            .names
+            .iter()
+            .find(|n| n.name == "rpc.buildernet.org")
+            .unwrap();
+        assert_eq!(rpc.addrs, vec![ip("200.225.47.181")]);
+        assert_eq!(rpc.source, Source::LastKnownGood);
+        let us = p
+            .names
+            .iter()
+            .find(|n| n.name == "direct-us.buildernet.org")
+            .unwrap();
+        assert!(us.addrs.is_empty());
+        assert_eq!(us.source, Source::Missing);
+        assert!(required_satisfied(&p.names));
+        assert!(!required_fresh(&p.names));
+    }
+
+    #[test]
+    fn names_from_kernel_reconstructs_per_name_state() {
+        let current_prod = vec![
+            entry(
+                "200.225.47.181",
+                &["rpc.buildernet.org", "direct-us.buildernet.org"],
+            ),
+            entry("35.213.62.127", &["direct-ap.buildernet.org"]),
+        ];
+        let names = names_from_kernel(&cfg(), &current_prod, "restore failed");
+        assert_eq!(names.len(), 3);
+        assert_eq!(names[0].addrs, vec![ip("200.225.47.181")]);
+        assert_eq!(names[0].source, Source::LastKnownGood);
+        assert_eq!(names[0].error.as_deref(), Some("restore failed"));
+        assert_eq!(names[2].addrs, vec![ip("35.213.62.127")]);
+        assert!(required_satisfied(&names));
+        assert!(!required_fresh(&names));
+        assert!(names_from_kernel(&cfg(), &[], "x")
+            .iter()
+            .all(|n| n.source == Source::Missing));
     }
 
     #[test]
     fn missing_result_for_endpoint_is_transient() {
         let a = answers(vec![ok("rpc.buildernet.org", &["200.225.47.181"])]);
         let p = compute(&cfg(), &a, &[], &[]);
-        let us = p.names.iter().find(|n| n.name == "direct-us.buildernet.org").unwrap();
+        let us = p
+            .names
+            .iter()
+            .find(|n| n.name == "direct-us.buildernet.org")
+            .unwrap();
         assert_eq!(us.outcome, Outcome::Transient);
         assert_eq!(us.source, Source::Missing);
     }

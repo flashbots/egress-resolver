@@ -17,29 +17,41 @@ MAINTENANCE_OUT ─j─▶ DYN_BNET_MAINTENANCE_OUT  ◀──   │
 
 ## How it works
 
-Two subcommands, run as two `ExecStart=` lines of one `Type=oneshot` systemd
-unit fired by a timer every minute:
+Two subcommands, run as two `Type=oneshot` systemd units (`egress-resolver.service`
+for `resolve`, `egress-resolver-apply.service` for `apply`; the timer starts the
+apply unit, which pulls in the resolve unit first) every minute:
 
-1. **`resolve`** (unprivileged) queries each configured name for `A` records
-   over DNS-over-TLS against the configured resolvers in order. An answer is
-   accepted only if the resolver set the AD bit (DNSSEC-validated), every
-   address is a global unicast IPv4 address, and the response is not
-   truncated. Authenticated NXDOMAIN/NODATA is an *empty* result; SERVFAIL,
-   timeouts, TLS failures and unauthenticated answers are *transient*. The
-   result is written to `answers.json`.
-2. **`apply`** (needs `CAP_NET_ADMIN`) takes the toggle lock and:
+1. **`resolve`** (unprivileged, no capabilities) queries every configured name
+   for `A` records over DNS-over-TLS, trying the configured resolvers in order
+   and all unsettled names concurrently on each. An answer is accepted only if
+   the resolver set the AD bit (DNSSEC-validated), the response is not
+   truncated, and the `A` records are owned by the queried name or by the end
+   of a CNAME chain starting at it; every address must be global unicast IPv4.
+   Authenticated NXDOMAIN/NODATA is an *empty* result; SERVFAIL, timeouts and
+   TLS failures are *transient* and retried; a missing AD bit or a non-global
+   address is *transient* but not retried on the same resolver. The whole run
+   is bounded by `resolver.deadline_secs` (30 s): unsettled names are reported
+   as transient. The result is written to `answers.json`; the command always
+   exits 0.
+2. **`apply`** (`CAP_NET_ADMIN`, no IP sockets) takes the toggle lock and:
+   * ignores answers that are missing, corrupt or older than three intervals,
+     treating every name as transient;
    * reads the two dynamic chains back from the kernel (`iptables -S`); the
      `--comment` on each rule records which name produced the address, so the
      kernel is the only state and the tool is stateless;
    * computes the new production set (fresh answers; last-known-good addresses
      for transient names; nothing for empty names) and the maintenance set
      (everything ever resolved since boot, never shrinking);
-   * replaces both chains atomically with `iptables-restore -n`;
-   * renders the hosts file from the same addresses;
-   * deletes conntrack entries for TCP flows that must not exist in the current
-     mode (production: retired addresses; otherwise: every known address);
+   * replaces both chains atomically with `iptables-restore -n`, then reads them
+     back and requires them to equal the plan (rule for rule); on any failure
+     the previous policy stays and everything below describes *that* policy;
+   * renders the hosts file from the installed addresses;
+   * deletes conntrack entries by destination for flows that must not exist in
+     the current mode (production: retired addresses; otherwise: every known
+     address);
    * writes `status.json` (consumed by `toggle` before entering production) and a
-     Prometheus textfile.
+     Prometheus textfile, then exits non-zero if the firewall, hosts or
+     conntrack step failed.
 
 Both chains are created empty by the image's `firewall-config` and are jumped
 to from static rules, so `iptables-save` remains a complete description of the
@@ -74,7 +86,7 @@ names = ["tx.tee-searcher.flashbots.net"]
 | Path | Writer | Purpose |
 |---|---|---|
 | `/run/egress-resolver/resolve/answers.json` | `resolve` | hand-off to `apply` |
-| `/run/egress-resolver/status.json` | `apply` | mode, per-name state, `required_satisfied`, errors; uptime-based timestamps |
+| `/run/egress-resolver/status.json` | `apply` | mode, per-name state, `apply_ok` / `hosts_ok` / `conntrack_ok`, `required_satisfied`, `required_fresh`, `killed` / `kill_failed`, errors; uptime-based timestamps |
 | `/run/egress-resolver/metrics/egress-resolver.prom` | `apply` | node-exporter textfile |
 | `/run/flashbox-endpoints/hosts` | `apply` | container `/etc/hosts` target |
 
@@ -86,8 +98,13 @@ All paths are overridable with command line options (`egress-resolver --help`).
 cargo test
 cargo clippy --all-targets -- -D warnings
 cargo run -- check-config --config examples/egress-resolver.toml
+cargo run -- print-servers --config examples/egress-resolver.toml   # for firewall-config
 cargo run -- resolve --config examples/egress-resolver.toml --answers /tmp/answers.json
 ```
+
+`check-config` is meant to run at image build time: `firewall-config` derives
+the resolver allowlist from the same file with `print-servers`, so a broken
+configuration must fail the build rather than the boot.
 
 The `apply` step can be exercised without root in a throwaway namespace:
 
@@ -106,8 +123,14 @@ unshare -Urn bash -c '
   configured resolver over authenticated TLS; the only files read are part of
   the measured image or written by this tool.
 * `resolve` runs without capabilities and may only open TCP/853 to the
-  configured resolvers (enforced by a uid-scoped host firewall rule);
-  `apply` runs with `CAP_NET_ADMIN` and never touches the network.
+  configured resolvers (enforced by a uid-scoped host firewall rule and the
+  unit's `RestrictAddressFamilies`); `apply` runs with `CAP_NET_ADMIN` in a
+  unit whose `RestrictAddressFamilies=AF_NETLINK AF_UNIX` makes IP sockets
+  impossible, not merely unused.
+* `apply` trusts the addresses `resolve` hands it beyond checking that they are
+  global unicast: the DNS step is part of what authorises egress, which is why
+  it parses only the pinned resolvers' TLS-authenticated answers. `CAP_NET_ADMIN`
+  itself is not confined to the two chains; the tool's own code is.
 * Addresses in loopback, link-local, private, shared, multicast, reserved and
   documentation ranges are rejected before they can reach the firewall.
 * Trust delta for an auditor of the image: the resolver's DNSSEC validation

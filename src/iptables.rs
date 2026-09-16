@@ -23,8 +23,7 @@ use crate::exec::Exec;
 pub const IPTABLES: &str = "/usr/sbin/iptables";
 pub const IPTABLES_RESTORE: &str = "/usr/sbin/iptables-restore";
 
-/// iptables limits comments to 256 bytes including the NUL.
-const MAX_COMMENT_LEN: usize = 255;
+use crate::config::MAX_COMMENT_LEN;
 
 /// One dynamic rule as read back from the kernel.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -67,11 +66,7 @@ pub fn parse_chain(output: &str, chain: &str) -> Vec<RuleEntry> {
                         i += 2;
                     }
                     "--comment" if i + 1 < toks.len() => {
-                        names.extend(
-                            toks[i + 1]
-                                .split_whitespace()
-                                .map(|s| s.to_string()),
-                        );
+                        names.extend(toks[i + 1].split_whitespace().map(|s| s.to_string()));
                         i += 2;
                     }
                     _ => i += 1,
@@ -268,7 +263,10 @@ COMMIT\n";
     #[test]
     fn render_parse_roundtrip() {
         let mut prod = AddrMap::new();
-        prod.insert("1.2.3.4".parse().unwrap(), names(&["a.example", "b.example"]));
+        prod.insert(
+            "1.2.3.4".parse().unwrap(),
+            names(&["a.example", "b.example"]),
+        );
         prod.insert("5.6.7.8".parse().unwrap(), names(&["b.example"]));
         let batch = render_restore(&fw(), &prod, &AddrMap::new());
         // simulate `iptables -S` normalisation of what we wrote
@@ -289,7 +287,10 @@ COMMIT\n";
         let c = comment(&many);
         assert!(c.len() <= MAX_COMMENT_LEN);
         assert!(!c.ends_with(' '));
-        assert!(c.split(' ').all(|n| many.contains(n)), "only whole names kept");
+        assert!(
+            c.split(' ').all(|n| many.contains(n)),
+            "only whole names kept"
+        );
     }
 
     #[test]
@@ -299,7 +300,10 @@ COMMIT\n";
         let err = read_chain(&mut ex, "DYN_BNET_PRODUCTION_OUT").unwrap_err();
         assert!(err.contains("failed"));
         assert_eq!(ex.calls[0].program, IPTABLES);
-        assert_eq!(ex.calls[0].args, vec!["-w", "5", "-S", "DYN_BNET_PRODUCTION_OUT"]);
+        assert_eq!(
+            ex.calls[0].args,
+            vec!["-w", "5", "-S", "DYN_BNET_PRODUCTION_OUT"]
+        );
     }
 
     #[test]

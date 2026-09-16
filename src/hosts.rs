@@ -77,7 +77,10 @@ mod tests {
             },
         ];
         let out = render(&statics, &names);
-        let lines: Vec<&str> = out.lines().filter(|l| !l.starts_with('#') && !l.is_empty()).collect();
+        let lines: Vec<&str> = out
+            .lines()
+            .filter(|l| !l.starts_with('#') && !l.is_empty())
+            .collect();
         assert_eq!(
             lines,
             vec![

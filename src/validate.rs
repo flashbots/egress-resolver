@@ -13,21 +13,21 @@ use std::net::Ipv4Addr;
 ///
 /// Each entry is `(network, prefix_len)`.
 const SPECIAL_RANGES: &[(Ipv4Addr, u8)] = &[
-    (Ipv4Addr::new(0, 0, 0, 0), 8),          // "this" network
-    (Ipv4Addr::new(10, 0, 0, 0), 8),         // private
-    (Ipv4Addr::new(100, 64, 0, 0), 10),      // shared address space (CGNAT)
-    (Ipv4Addr::new(127, 0, 0, 0), 8),        // loopback
-    (Ipv4Addr::new(169, 254, 0, 0), 16),     // link-local (cloud metadata lives here)
-    (Ipv4Addr::new(172, 16, 0, 0), 12),      // private
-    (Ipv4Addr::new(192, 0, 0, 0), 24),       // IETF protocol assignments
-    (Ipv4Addr::new(192, 0, 2, 0), 24),       // TEST-NET-1
-    (Ipv4Addr::new(192, 88, 99, 0), 24),     // 6to4 relay anycast (deprecated)
-    (Ipv4Addr::new(192, 168, 0, 0), 16),     // private
-    (Ipv4Addr::new(198, 18, 0, 0), 15),      // benchmarking
-    (Ipv4Addr::new(198, 51, 100, 0), 24),    // TEST-NET-2
-    (Ipv4Addr::new(203, 0, 113, 0), 24),     // TEST-NET-3
-    (Ipv4Addr::new(224, 0, 0, 0), 4),        // multicast
-    (Ipv4Addr::new(240, 0, 0, 0), 4),        // reserved + broadcast
+    (Ipv4Addr::new(0, 0, 0, 0), 8),       // "this" network
+    (Ipv4Addr::new(10, 0, 0, 0), 8),      // private
+    (Ipv4Addr::new(100, 64, 0, 0), 10),   // shared address space (CGNAT)
+    (Ipv4Addr::new(127, 0, 0, 0), 8),     // loopback
+    (Ipv4Addr::new(169, 254, 0, 0), 16),  // link-local (cloud metadata lives here)
+    (Ipv4Addr::new(172, 16, 0, 0), 12),   // private
+    (Ipv4Addr::new(192, 0, 0, 0), 24),    // IETF protocol assignments
+    (Ipv4Addr::new(192, 0, 2, 0), 24),    // TEST-NET-1
+    (Ipv4Addr::new(192, 88, 99, 0), 24),  // 6to4 relay anycast (deprecated)
+    (Ipv4Addr::new(192, 168, 0, 0), 16),  // private
+    (Ipv4Addr::new(198, 18, 0, 0), 15),   // benchmarking
+    (Ipv4Addr::new(198, 51, 100, 0), 24), // TEST-NET-2
+    (Ipv4Addr::new(203, 0, 113, 0), 24),  // TEST-NET-3
+    (Ipv4Addr::new(224, 0, 0, 0), 4),     // multicast
+    (Ipv4Addr::new(240, 0, 0, 0), 4),     // reserved + broadcast
 ];
 
 /// Returns `true` if `ip` is a globally routable unicast address.
@@ -76,7 +76,7 @@ mod tests {
         for a in [
             "0.0.0.0",
             "0.1.2.3",
-            "10.88.0.100",   // Prometheus proxy
+            "10.88.0.100", // Prometheus proxy
             "10.0.0.1",
             "100.64.0.1",
             "100.127.255.254",
