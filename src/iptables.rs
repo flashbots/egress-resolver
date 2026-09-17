@@ -157,9 +157,38 @@ pub fn render_restore(fw: &FirewallConfig, production: &AddrMap, maintenance: &A
     s
 }
 
+/// A chain as read back from the kernel.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct ChainRead {
+    /// The rules `parse_chain` understood: one destination each.
+    pub entries: Vec<RuleEntry>,
+    /// Every `-A <chain>` line, including rules `parse_chain` ignored.
+    pub rule_lines: usize,
+}
+
+impl ChainRead {
+    /// True if the chain holds anything but exactly one rule per address: a
+    /// rule without a destination (not one of ours) or the same address twice
+    /// (a partially applied earlier batch). Such a chain is rewritten even when
+    /// its address map already equals the plan.
+    pub fn is_dirty(&self) -> bool {
+        self.rule_lines != self.entries.len()
+            || entries_to_map(&self.entries).len() != self.entries.len()
+    }
+}
+
+/// Number of `-A <chain>` lines in `iptables -S <chain>` output.
+pub fn count_rules(output: &str, chain: &str) -> usize {
+    let prefix = format!("-A {chain} ");
+    output
+        .lines()
+        .filter(|l| l.trim().starts_with(&prefix))
+        .count()
+}
+
 /// Read the current contents of a chain. Fails if the chain does not exist,
 /// which means the firewall has not been initialised.
-pub fn read_chain(exec: &mut dyn Exec, chain: &str) -> Result<Vec<RuleEntry>, String> {
+pub fn read_chain(exec: &mut dyn Exec, chain: &str) -> Result<ChainRead, String> {
     let out = exec
         .run(IPTABLES, &["-w", "5", "-S", chain], None)
         .map_err(|e| format!("cannot run {IPTABLES}: {e}"))?;
@@ -170,7 +199,10 @@ pub fn read_chain(exec: &mut dyn Exec, chain: &str) -> Result<Vec<RuleEntry>, St
             out.stderr.trim()
         ));
     }
-    Ok(parse_chain(&out.stdout, chain))
+    Ok(ChainRead {
+        entries: parse_chain(&out.stdout, chain),
+        rule_lines: count_rules(&out.stdout, chain),
+    })
 }
 
 /// Apply a restore batch atomically.
@@ -314,5 +346,30 @@ COMMIT\n";
         assert_eq!(ex.calls[0].program, IPTABLES_RESTORE);
         assert_eq!(ex.calls[0].args, vec!["-w", "5", "-n"]);
         assert_eq!(ex.calls[0].stdin.as_deref(), Some("*filter\nCOMMIT\n"));
+    }
+
+    #[test]
+    fn dirty_chain_detection() {
+        let clean = ChainRead {
+            entries: parse_chain(IPTABLES_S, "DYN_BNET_PRODUCTION_OUT")
+                .into_iter()
+                .take(2)
+                .collect(),
+            rule_lines: 2,
+        };
+        assert!(!clean.is_dirty());
+        // IPTABLES_S has a third rule without -d: foreign, must be cleaned
+        let foreign = ChainRead {
+            entries: parse_chain(IPTABLES_S, "DYN_BNET_PRODUCTION_OUT"),
+            rule_lines: count_rules(IPTABLES_S, "DYN_BNET_PRODUCTION_OUT"),
+        };
+        assert_eq!(foreign.rule_lines, 3);
+        assert!(foreign.is_dirty());
+        // the same address twice
+        let mut dup = clean.clone();
+        dup.entries.push(dup.entries[0].clone());
+        dup.rule_lines = 3;
+        assert!(dup.is_dirty());
+        assert!(!ChainRead::default().is_dirty());
     }
 }

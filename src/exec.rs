@@ -82,6 +82,15 @@ pub mod fake {
             });
             self
         }
+
+        pub fn respond_stderr(mut self, status: i32, stderr: &str) -> Self {
+            self.responses.push_back(Output {
+                status,
+                stdout: String::new(),
+                stderr: stderr.to_string(),
+            });
+            self
+        }
     }
 
     impl Exec for FakeExec {

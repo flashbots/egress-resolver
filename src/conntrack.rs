@@ -9,7 +9,7 @@
 
 use std::net::Ipv4Addr;
 
-use crate::exec::Exec;
+use crate::exec::{Exec, Output};
 use crate::iptables::AddrMap;
 
 pub const CONNTRACK: &str = "/usr/sbin/conntrack";
@@ -31,19 +31,32 @@ pub fn kill_set(mode: &str, production: &AddrMap, maintenance: &AddrMap) -> Vec<
 ///
 /// Destination-only, like `toggle`'s own teardown: the maintenance drop rules
 /// are port-agnostic, so the sweep must be too. Returns the addresses whose
-/// deletion command failed. `conntrack -D` exits 1 when nothing matched, which
-/// is not a failure here.
+/// deletion command failed.
+///
+/// `conntrack -D` exits 1 both when nothing matched and on operational errors
+/// (missing kernel support, netlink failures). Only the former is a success
+/// here, so exit 1 is accepted solely when the tool printed its `0 flow
+/// entries have been deleted` summary (locale is pinned to C by `Exec`).
 pub fn kill(exec: &mut dyn Exec, ips: &[Ipv4Addr]) -> Vec<(Ipv4Addr, String)> {
     let mut failed = Vec::new();
     for ip in ips {
         let dst = ip.to_string();
         match exec.run(CONNTRACK, &["-D", "-d", &dst], None) {
-            Ok(out) if out.status == 0 || out.status == 1 => {}
+            Ok(out) if out.status == 0 => {}
+            Ok(out) if out.status == 1 && deleted_nothing(&out) => {}
             Ok(out) => failed.push((*ip, format!("status {}: {}", out.status, out.stderr.trim()))),
             Err(e) => failed.push((*ip, e.to_string())),
         }
     }
     failed
+}
+
+const NO_MATCH_SUMMARY: &str = "0 flow entries have been deleted";
+
+/// True if the tool's summary line reports that nothing was deleted. The
+/// summary goes to stderr; stdout is checked too in case that ever changes.
+fn deleted_nothing(out: &Output) -> bool {
+    out.stderr.contains(NO_MATCH_SUMMARY) || out.stdout.contains(NO_MATCH_SUMMARY)
 }
 
 #[cfg(test)]
@@ -83,16 +96,36 @@ mod tests {
     #[test]
     fn kill_runs_one_destination_delete_per_address_and_tolerates_no_match() {
         let mut ex = FakeExec::default()
-            .respond(1, "0 flow entries have been deleted.")
-            .respond(0, "");
+            .respond_stderr(
+                1,
+                "conntrack v1.4.8 (conntrack-tools): 0 flow entries have been deleted.\n",
+            )
+            .respond_stderr(
+                0,
+                "conntrack v1.4.8 (conntrack-tools): 2 flow entries have been deleted.\n",
+            );
         let failed = kill(&mut ex, &[ip("1.1.1.1"), ip("2.2.2.2")]);
-        assert!(failed.is_empty());
+        assert!(failed.is_empty(), "{failed:?}");
         assert_eq!(ex.calls.len(), 2);
         assert_eq!(ex.calls[0].args, vec!["-D", "-d", "1.1.1.1"]);
     }
 
     #[test]
-    fn kill_reports_real_failures() {
+    fn kill_treats_exit_1_without_no_match_summary_as_failure() {
+        // conntrack exits 1 for operational errors too
+        let mut ex = FakeExec::default()
+            .respond_stderr(
+                1,
+                "conntrack v1.4.8 (conntrack-tools): Operation failed: No such file or directory\n",
+            )
+            .respond(1, "");
+        let failed = kill(&mut ex, &[ip("1.1.1.1"), ip("2.2.2.2")]);
+        assert_eq!(failed.len(), 2, "{failed:?}");
+        assert!(failed[0].1.contains("Operation failed"));
+    }
+
+    #[test]
+    fn kill_reports_other_exit_codes_as_failures() {
         let mut ex = FakeExec::default().respond(2, "");
         let failed = kill(&mut ex, &[ip("1.1.1.1")]);
         assert_eq!(failed.len(), 1);

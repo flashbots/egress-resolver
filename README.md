@@ -30,15 +30,23 @@ apply unit, which pulls in the resolve unit first) every minute:
    Authenticated NXDOMAIN/NODATA is an *empty* result; SERVFAIL, timeouts and
    TLS failures are *transient* and retried; a missing AD bit or a non-global
    address is *transient* but not retried on the same resolver. The whole run
-   is bounded by `resolver.deadline_secs` (30 s): unsettled names are reported
-   as transient. The result is written to `answers.json`; the command always
-   exits 0.
+   is bounded by `resolver.deadline_secs` (30 s): every answer is recorded the
+   moment it arrives, and only the names still unsettled at the deadline are
+   reported as transient. The result is written to `answers.json`; the command
+   always exits 0. Note that with `require_authenticated` a name whose CNAME
+   chain ends in an unsigned zone never gets a fresh answer (the resolver
+   cannot set the AD bit), so it stays on last-known-good addresses for the
+   rest of the boot; the zone owner has to keep every hop signed.
 2. **`apply`** (`CAP_NET_ADMIN`, no IP sockets) takes the toggle lock and:
-   * ignores answers that are missing, corrupt or older than three intervals,
-     treating every name as transient;
+   * ignores answers that are missing, corrupt, older than three intervals, or
+     already applied by the previous run (same generation time, i.e. the
+     resolve step produced nothing new), treating every name as transient; the
+     file is opened without following symlinks;
    * reads the two dynamic chains back from the kernel (`iptables -S`); the
      `--comment` on each rule records which name produced the address, so the
-     kernel is the only state and the tool is stateless;
+     kernel is the only state and the tool is stateless. A chain holding
+     anything but one rule per address (a duplicate, a rule that is not ours)
+     is rewritten even if its addresses already match;
    * computes the new production set (fresh answers; last-known-good addresses
      for transient names; nothing for empty names) and the maintenance set
      (everything ever resolved since boot, never shrinking);
@@ -48,10 +56,14 @@ apply unit, which pulls in the resolve unit first) every minute:
    * renders the hosts file from the installed addresses;
    * deletes conntrack entries by destination for flows that must not exist in
      the current mode (production: retired addresses; otherwise: every known
-     address);
+     address); `conntrack -D` exiting 1 counts as success only when it reports
+     `0 flow entries have been deleted`, since operational errors exit 1 too;
    * writes `status.json` (consumed by `toggle` before entering production) and a
      Prometheus textfile, then exits non-zero if the firewall, hosts or
-     conntrack step failed.
+     conntrack step failed. The only value carried from one run to the next is
+     `last_fresh_uptime_secs` per name (read back from the previous
+     `status.json` of the same boot), which is what tells a reader how long an
+     endpoint has been running on last-known-good addresses.
 
 Both chains are created empty by the image's `firewall-config` and are jumped
 to from static rules, so `iptables-save` remains a complete description of the
@@ -86,7 +98,7 @@ names = ["tx.tee-searcher.flashbots.net"]
 | Path | Writer | Purpose |
 |---|---|---|
 | `/run/egress-resolver/resolve/answers.json` | `resolve` | hand-off to `apply` |
-| `/run/egress-resolver/status.json` | `apply` | mode, per-name state, `apply_ok` / `hosts_ok` / `conntrack_ok`, `required_satisfied`, `required_fresh`, `killed` / `kill_failed`, errors; uptime-based timestamps |
+| `/run/egress-resolver/status.json` | `apply` | mode, per-name state, `apply_ok` / `hosts_ok` / `conntrack_ok`, `required_satisfied`, `required_fresh`, `last_fresh_uptime_secs` per name, `killed` / `kill_failed`, errors; uptime-based timestamps |
 | `/run/egress-resolver/metrics/egress-resolver.prom` | `apply` | node-exporter textfile |
 | `/run/flashbox-endpoints/hosts` | `apply` | container `/etc/hosts` target |
 

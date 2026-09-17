@@ -9,14 +9,16 @@
 //!
 //! The whole run is bounded by `resolver.deadline_secs`: whatever is unsettled
 //! when the budget expires is reported as transient, so `apply` always gets an
-//! answers file in time.
+//! answers file in time. Every answer is recorded the moment its query
+//! completes, so a deadline that fires while other names are still pending
+//! never discards answers that had already arrived.
 
 use std::collections::BTreeSet;
 use std::net::{Ipv4Addr, SocketAddr};
 use std::sync::Arc;
 use std::time::Duration;
 
-use futures_util::future::join_all;
+use futures_util::stream::{FuturesUnordered, Stream};
 use futures_util::StreamExt;
 use hickory_net::proto::op::{DnsRequestOptions, Message, Query, ResponseCode};
 use hickory_net::proto::rr::{DNSClass, Name, RData, RecordType};
@@ -242,22 +244,40 @@ async fn resolve_servers(
                     continue;
                 }
             };
-        let outcomes = join_all(pending.iter().map(|&i| {
-            resolve_name(
-                &exchange,
-                &names[i],
-                addr,
-                cfg.resolver.attempts,
-                query_timeout,
-                cfg.resolver.require_authenticated,
-            )
-        }))
-        .await;
-        for (i, outcome) in pending.into_iter().zip(outcomes) {
-            match outcome {
-                Ok(r) => results[i] = Some(r),
-                Err(e) => last_error[i] = e,
-            }
+        let queries: FuturesUnordered<_> = pending
+            .iter()
+            .map(|&i| {
+                let exchange = &exchange;
+                let name = &names[i];
+                async move {
+                    let outcome = resolve_name(
+                        exchange,
+                        name,
+                        addr,
+                        cfg.resolver.attempts,
+                        query_timeout,
+                        cfg.resolver.require_authenticated,
+                    )
+                    .await;
+                    (i, outcome)
+                }
+            })
+            .collect();
+        settle(queries, results, last_error).await;
+    }
+}
+
+/// Record each query's outcome as soon as it completes. If the caller's
+/// deadline drops this future mid-way, everything recorded so far stays in
+/// `results`; only the still-pending queries are lost.
+async fn settle<S>(mut queries: S, results: &mut [Option<NameResult>], last_error: &mut [String])
+where
+    S: Stream<Item = (usize, Result<NameResult, String>)> + Unpin,
+{
+    while let Some((i, outcome)) = queries.next().await {
+        match outcome {
+            Ok(r) => results[i] = Some(r),
+            Err(e) => last_error[i] = e,
         }
     }
 }
@@ -586,5 +606,51 @@ mod tests {
             }
             other => panic!("unexpected {other:?}"),
         }
+    }
+
+    fn fake_result(name: &str) -> NameResult {
+        NameResult {
+            name: name.into(),
+            outcome: Outcome::Ok,
+            addrs: vec!["200.225.47.181".parse().unwrap()],
+            min_ttl: Some(300),
+            server: Some("1.1.1.1:853".into()),
+            error: None,
+        }
+    }
+
+    type BoxedQuery =
+        std::pin::Pin<Box<dyn std::future::Future<Output = (usize, Result<NameResult, String>)>>>;
+
+    #[tokio::test]
+    async fn settle_keeps_completed_answers_when_the_deadline_fires() {
+        let queries: FuturesUnordered<BoxedQuery> = FuturesUnordered::new();
+        // name 0 answers immediately, name 1 fails immediately, name 2 never answers
+        queries.push(Box::pin(async {
+            (0, Ok(fake_result("rpc.buildernet.org")))
+        }));
+        queries.push(Box::pin(async {
+            (1, Err("1.1.1.1:853: SERVFAIL".to_string()))
+        }));
+        queries.push(Box::pin(async {
+            std::future::pending::<()>().await;
+            (2, Err("unreachable".to_string()))
+        }));
+        let mut results: Vec<Option<NameResult>> = vec![None, None, None];
+        let mut last_error = vec![String::new(), String::new(), String::new()];
+        let deadline = tokio::time::timeout(
+            Duration::from_millis(100),
+            settle(queries, &mut results, &mut last_error),
+        )
+        .await;
+        assert!(deadline.is_err(), "the pending query must hit the deadline");
+        assert_eq!(
+            results[0].as_ref().map(|r| r.name.as_str()),
+            Some("rpc.buildernet.org"),
+            "answer that arrived before the deadline is kept"
+        );
+        assert!(results[1].is_none());
+        assert_eq!(last_error[1], "1.1.1.1:853: SERVFAIL");
+        assert!(results[2].is_none() && last_error[2].is_empty());
     }
 }

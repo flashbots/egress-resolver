@@ -216,9 +216,10 @@ fn cmd_apply(opts: &Opts) -> Result<(), String> {
 fn load_answers(
     path: &Path,
     now_uptime: f64,
+    already_applied_uptime: Option<f64>,
     errors: &mut Vec<String>,
 ) -> (answers::Answers, Option<f64>) {
-    let parsed = std::fs::read_to_string(path)
+    let parsed = read_answers_file(path)
         .map_err(|e| e.to_string())
         .and_then(|s| serde_json::from_str::<answers::Answers>(&s).map_err(|e| e.to_string()));
     match parsed {
@@ -229,6 +230,15 @@ fn load_answers(
             errors.push(format!(
                 "answers are {:.0}s old (limit {ANSWERS_MAX_AGE_SECS:.0}s); treating resolution as failed",
                 now_uptime - a.generated_uptime_secs
+            ));
+        }
+        Ok(a) if Some(a.generated_uptime_secs) == already_applied_uptime => {
+            // The resolve step did not produce a new file since the previous
+            // run (it died, or apply was started on its own): nothing here is
+            // fresh, however recent the file looks.
+            errors.push(format!(
+                "answers generated at uptime {:.0}s were already applied by the previous run; treating resolution as failed",
+                a.generated_uptime_secs
             ));
         }
         Ok(a) => {
@@ -247,8 +257,25 @@ fn load_answers(
     )
 }
 
-/// The whole reconciliation, with every side effect behind `exec` and `opts`
-/// so it can be exercised end to end in tests.
+/// Read the answers file without following a symlink: it lives in a directory
+/// owned by the unprivileged resolve step and is read here as root.
+fn read_answers_file(path: &Path) -> std::io::Result<String> {
+    use std::io::Read;
+    use std::os::unix::fs::OpenOptionsExt;
+    let mut f = std::fs::OpenOptions::new()
+        .read(true)
+        .custom_flags(libc::O_NOFOLLOW | libc::O_CLOEXEC)
+        .open(path)?;
+    if !f.metadata()?.is_file() {
+        return Err(std::io::Error::other("not a regular file"));
+    }
+    let mut s = String::new();
+    f.read_to_string(&mut s)?;
+    Ok(s)
+}
+
+/// One reconciliation pass: read the answers and the kernel, compute the plan,
+/// rewrite the chains if needed, publish hosts, sweep conntrack, write status.
 fn run_apply(
     cfg: &Config,
     opts: &Opts,
@@ -256,26 +283,39 @@ fn run_apply(
     now_uptime: f64,
 ) -> Result<status::Status, String> {
     let mut errors: Vec<String> = Vec::new();
-    let (answers, answers_uptime) = load_answers(&opts.answers, now_uptime, &mut errors);
+    let boot_id = sysutil::boot_id();
+    let prev = status::PrevStatus::load(&opts.status, &boot_id).unwrap_or_default();
+    let (answers, answers_uptime) = load_answers(
+        &opts.answers,
+        now_uptime,
+        prev.answers_uptime_secs,
+        &mut errors,
+    );
 
     let _lock = sysutil::lock_exclusive(&opts.lock, opts.lock_timeout)
         .map_err(|e| format!("lock {}: {e}", opts.lock.display()))?;
 
     let current_prod = iptables::read_chain(exec, &cfg.firewall.production_chain)?;
     let current_maint = iptables::read_chain(exec, &cfg.firewall.maintenance_chain)?;
-    let current_prod_map = entries_to_map(&current_prod);
-    let current_maint_map = entries_to_map(&current_maint);
+    let current_prod_map = entries_to_map(&current_prod.entries);
+    let current_maint_map = entries_to_map(&current_maint.entries);
 
-    let plan = plan::compute(cfg, &answers, &current_prod, &current_maint);
+    let plan = plan::compute(cfg, &answers, &current_prod.entries, &current_maint.entries);
     if let Some(e) = &plan.error {
         errors.push(e.clone());
     }
 
-    // 1. Firewall. Rewrite both chains only if the plan differs, then read the
+    // 1. Firewall. Rewrite both chains only if the plan differs or a chain
+    //    holds something other than one rule per address (a duplicate from an
+    //    interrupted earlier batch, a rule that is not ours), then read the
     //    kernel back: the chains must hold exactly the plan (same rules, same
     //    count), otherwise the update is treated as failed.
     let mut apply_ok = true;
-    if plan.production == current_prod_map && plan.maintenance == current_maint_map {
+    let dirty = current_prod.is_dirty() || current_maint.is_dirty();
+    if dirty {
+        eprintln!("egress-resolver: firewall chains hold unexpected rules; rewriting");
+    }
+    if !dirty && plan.production == current_prod_map && plan.maintenance == current_maint_map {
         eprintln!("egress-resolver: firewall chains unchanged");
     } else {
         let batch = iptables::render_restore(&cfg.firewall, &plan.production, &plan.maintenance);
@@ -312,9 +352,11 @@ fn run_apply(
         )
     } else {
         let prod = iptables::read_chain(exec, &cfg.firewall.production_chain)
-            .unwrap_or(current_prod.clone());
+            .map(|c| c.entries)
+            .unwrap_or(current_prod.entries.clone());
         let maint = iptables::read_chain(exec, &cfg.firewall.maintenance_chain)
-            .unwrap_or(current_maint.clone());
+            .map(|c| c.entries)
+            .unwrap_or(current_maint.entries.clone());
         (
             plan::names_from_kernel(
                 cfg,
@@ -350,10 +392,24 @@ fn run_apply(
         .filter(|ip| !kill_failed.contains(ip))
         .collect();
 
+    // 4. Freshness bookkeeping: when each name's installed addresses last came
+    //    from a fresh authenticated answer. Names whose source is fresh in this
+    //    run (only possible when the update succeeded) get "now"; the rest
+    //    carry the previous run's value forward.
+    let generated_uptime_secs = sysutil::uptime_secs().unwrap_or(now_uptime);
+    let mut last_fresh_uptime_secs = prev.last_fresh_uptime_secs;
+    last_fresh_uptime_secs.retain(|name, _| names.iter().any(|n| &n.name == name));
+    for n in names
+        .iter()
+        .filter(|n| matches!(n.source, plan::Source::Fresh | plan::Source::Empty))
+    {
+        last_fresh_uptime_secs.insert(n.name.clone(), generated_uptime_secs);
+    }
+
     let st = status::Status {
         schema: status::SCHEMA,
-        boot_id: sysutil::boot_id(),
-        generated_uptime_secs: sysutil::uptime_secs().unwrap_or(now_uptime),
+        boot_id,
+        generated_uptime_secs,
         answers_uptime_secs: answers_uptime,
         mode,
         apply_ok,
@@ -361,6 +417,7 @@ fn run_apply(
         conntrack_ok: kill_failed.is_empty(),
         required_satisfied: apply_ok && hosts_ok && plan::required_satisfied(&names),
         required_fresh: apply_ok && plan::required_fresh(&names),
+        last_fresh_uptime_secs,
         endpoints: names,
         production: effective_prod.keys().copied().collect(),
         maintenance: effective_maint.keys().copied().collect(),
@@ -398,19 +455,25 @@ fn verify_chains(cfg: &Config, exec: &mut dyn Exec, plan: &plan::Plan) -> Result
     let prod = iptables::read_chain(exec, &cfg.firewall.production_chain)?;
     let maint = iptables::read_chain(exec, &cfg.firewall.maintenance_chain)?;
     let mut problems = Vec::new();
-    if prod.len() != plan.production.len() || entries_to_map(&prod) != plan.production {
+    if prod.is_dirty()
+        || prod.entries.len() != plan.production.len()
+        || entries_to_map(&prod.entries) != plan.production
+    {
         problems.push(format!(
             "{} holds {} rule(s) after restore, expected {}",
             cfg.firewall.production_chain,
-            prod.len(),
+            prod.rule_lines,
             plan.production.len()
         ));
     }
-    if maint.len() != plan.maintenance.len() || entries_to_map(&maint) != plan.maintenance {
+    if maint.is_dirty()
+        || maint.entries.len() != plan.maintenance.len()
+        || entries_to_map(&maint.entries) != plan.maintenance
+    {
         problems.push(format!(
             "{} holds {} rule(s) after restore, expected {}",
             cfg.firewall.maintenance_chain,
-            maint.len(),
+            maint.rule_lines,
             plan.maintenance.len()
         ));
     }
@@ -819,5 +882,110 @@ names = ["tx.tee-searcher.flashbots.net"]
             "B must not be applied"
         );
         assert_eq!(ex.calls.len(), 3, "no restore");
+    }
+
+    #[test]
+    fn answers_already_applied_by_the_previous_run_are_not_fresh() {
+        let h = Harness::new("consumed");
+        h.answers(vec![ok("rpc.buildernet.org", &[A])], 100.0);
+        let mut ex = FakeExec::default()
+            .respond(0, &chain("P", &[]))
+            .respond(0, &chain("M", &[]))
+            .respond(0, "") // restore
+            .respond(0, &chain("P", &[(A, "rpc.buildernet.org")]))
+            .respond(0, &chain("M", &[(A, "rpc.buildernet.org")]))
+            .respond(0, ""); // conntrack A
+        let st = run_apply(&h.cfg, &h.opts, &mut ex, 110.0).unwrap();
+        assert!(st.all_ok() && st.required_fresh);
+        assert!(st.last_fresh_uptime_secs.contains_key("rpc.buildernet.org"));
+        let first_fresh = st.last_fresh_uptime_secs["rpc.buildernet.org"];
+        // same answers file again (resolve step produced nothing new)
+        let mut ex = FakeExec::default()
+            .respond(0, &chain("P", &[(A, "rpc.buildernet.org")]))
+            .respond(0, &chain("M", &[(A, "rpc.buildernet.org")]))
+            .respond(0, "");
+        let st = run_apply(&h.cfg, &h.opts, &mut ex, 120.0).unwrap();
+        assert!(st.all_ok() && st.required_satisfied);
+        assert!(!st.required_fresh, "nothing was freshly resolved");
+        assert!(
+            st.errors.iter().any(|e| e.contains("already applied")),
+            "{:?}",
+            st.errors
+        );
+        assert_eq!(st.endpoints[0].source, plan::Source::LastKnownGood);
+        assert_eq!(
+            st.last_fresh_uptime_secs["rpc.buildernet.org"], first_fresh,
+            "last fresh time is carried forward, not refreshed"
+        );
+        assert_eq!(ex.calls.len(), 3, "no restore");
+        assert!(st
+            .to_metrics()
+            .contains("egress_resolver_endpoint_fresh_age_seconds{name=\"rpc.buildernet.org\"}"));
+    }
+
+    #[test]
+    fn dirty_chain_is_rewritten_even_when_addresses_match() {
+        let h = Harness::new("dirty");
+        h.answers(vec![ok("rpc.buildernet.org", &[A])], 100.0);
+        // P holds the right address plus a rule without a destination
+        let mut dirty_p = chain("P", &[(A, "rpc.buildernet.org")]);
+        dirty_p.push_str("-A P -p tcp -m tcp --dport 443 -j ACCEPT\n");
+        let mut ex = FakeExec::default()
+            .respond(0, &dirty_p)
+            .respond(0, &chain("M", &[(A, "rpc.buildernet.org")]))
+            .respond(0, "") // restore
+            .respond(0, &chain("P", &[(A, "rpc.buildernet.org")]))
+            .respond(0, &chain("M", &[(A, "rpc.buildernet.org")]))
+            .respond(0, ""); // conntrack A
+        let st = run_apply(&h.cfg, &h.opts, &mut ex, 110.0).unwrap();
+        assert!(st.all_ok(), "{:?}", st.errors);
+        assert_eq!(
+            ex.calls[2].program,
+            iptables::IPTABLES_RESTORE,
+            "chain was rewritten"
+        );
+        assert!(st.added.is_empty() && st.removed.is_empty());
+        // duplicate rules count as dirty too
+        let mut ex = FakeExec::default()
+            .respond(
+                0,
+                &chain("P", &[(A, "rpc.buildernet.org"), (A, "rpc.buildernet.org")]),
+            )
+            .respond(0, &chain("M", &[(A, "rpc.buildernet.org")]))
+            .respond(0, "")
+            .respond(0, &chain("P", &[(A, "rpc.buildernet.org")]))
+            .respond(0, &chain("M", &[(A, "rpc.buildernet.org")]))
+            .respond(0, "");
+        let st = run_apply(&h.cfg, &h.opts, &mut ex, 120.0).unwrap();
+        assert!(st.apply_ok, "{:?}", st.errors);
+        assert_eq!(ex.calls[2].program, iptables::IPTABLES_RESTORE);
+    }
+
+    #[test]
+    fn symlinked_answers_file_is_rejected() {
+        let h = Harness::new("symlink");
+        let target = h.dir.join("real.json");
+        let a = Answers {
+            schema: answers::SCHEMA,
+            generated_uptime_secs: 100.0,
+            results: vec![ok("rpc.buildernet.org", &[B])],
+        };
+        fs::write(&target, serde_json::to_string(&a).unwrap()).unwrap();
+        std::os::unix::fs::symlink(&target, &h.opts.answers).unwrap();
+        let mut ex = FakeExec::default()
+            .respond(0, &chain("P", &[(A, "rpc.buildernet.org")]))
+            .respond(0, &chain("M", &[(A, "rpc.buildernet.org")]))
+            .respond(0, "");
+        let st = run_apply(&h.cfg, &h.opts, &mut ex, 110.0).unwrap();
+        assert!(
+            st.errors.iter().any(|e| e.contains("cannot read answers")),
+            "{:?}",
+            st.errors
+        );
+        assert_eq!(
+            st.production,
+            vec![A.parse::<std::net::Ipv4Addr>().unwrap()],
+            "B from the symlink target must not be applied"
+        );
     }
 }

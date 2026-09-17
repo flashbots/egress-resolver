@@ -1,8 +1,10 @@
 //! `status.json` (consumed by `toggle`) and the Prometheus textfile.
 
+use std::collections::BTreeMap;
 use std::net::Ipv4Addr;
+use std::path::Path;
 
-use serde::Serialize;
+use serde::{Deserialize, Serialize};
 
 use crate::plan::{NameState, Source};
 
@@ -34,6 +36,12 @@ pub struct Status {
     /// Every `required` endpoint's addresses come from a fresh authenticated
     /// answer in this run rather than last-known-good.
     pub required_fresh: bool,
+    /// Per endpoint name, the `/proc/uptime` seconds of the last run whose
+    /// installed addresses came from a fresh authenticated answer. Carried
+    /// forward from the previous status of the same boot, so a reader can tell
+    /// how long an endpoint has been running on last-known-good addresses.
+    /// Absent for a name that has never had a fresh answer this boot.
+    pub last_fresh_uptime_secs: BTreeMap<String, f64>,
     pub endpoints: Vec<NameState>,
     pub production: Vec<Ipv4Addr>,
     pub maintenance: Vec<Ipv4Addr>,
@@ -45,6 +53,29 @@ pub struct Status {
     pub kill_failed: Vec<Ipv4Addr>,
     #[serde(skip_serializing_if = "Vec::is_empty")]
     pub errors: Vec<String>,
+}
+
+/// The subset of a previous `status.json` that the next run carries forward.
+/// Tolerates older and newer schemas: every field defaults.
+#[derive(Debug, Default, Clone, Deserialize)]
+pub struct PrevStatus {
+    #[serde(default)]
+    pub boot_id: String,
+    #[serde(default)]
+    pub answers_uptime_secs: Option<f64>,
+    #[serde(default)]
+    pub last_fresh_uptime_secs: BTreeMap<String, f64>,
+}
+
+impl PrevStatus {
+    /// The previous run's status, if the file exists, parses and was written
+    /// during this boot. Anything else is ignored: `/run` is a tmpfs, so a
+    /// stale file can only come from an unusual setup.
+    pub fn load(path: &Path, boot_id: &str) -> Option<Self> {
+        let text = std::fs::read_to_string(path).ok()?;
+        let prev: PrevStatus = serde_json::from_str(&text).ok()?;
+        (prev.boot_id == boot_id).then_some(prev)
+    }
 }
 
 impl Status {
@@ -156,6 +187,21 @@ impl Status {
             "1 if the endpoint's addresses come from a fresh authenticated answer.",
             &fresh,
         );
+        let ages: Vec<(String, f64)> = self
+            .last_fresh_uptime_secs
+            .iter()
+            .map(|(name, t)| {
+                (
+                    format!("{{name=\"{name}\"}}"),
+                    (self.generated_uptime_secs - t).max(0.0),
+                )
+            })
+            .collect();
+        family(
+            "egress_resolver_endpoint_fresh_age_seconds",
+            "Seconds since the endpoint's installed addresses last came from a fresh answer (absent if never this boot).",
+            &ages,
+        );
         m
     }
 }
@@ -186,6 +232,9 @@ mod tests {
             conntrack_ok: false,
             required_satisfied: true,
             required_fresh: true,
+            last_fresh_uptime_secs: [("rpc.buildernet.org".to_string(), 10.0)]
+                .into_iter()
+                .collect(),
             endpoints: vec![NameState {
                 name: "rpc.buildernet.org".into(),
                 required: true,
@@ -211,6 +260,9 @@ mod tests {
         assert!(m.contains("egress_resolver_required_fresh 1\n"));
         assert!(m.contains("egress_resolver_conntrack_ok 0\n"));
         assert!(m.contains("egress_resolver_kill_failed 1\n"));
+        assert!(m.contains(
+            "egress_resolver_endpoint_fresh_age_seconds{name=\"rpc.buildernet.org\"} 2.5\n"
+        ));
         // The text format allows exactly one HELP/TYPE header per metric family;
         // node-exporter drops the whole file otherwise.
         let mut help_names: Vec<&str> = m
@@ -239,5 +291,30 @@ mod tests {
         assert!(j.contains("\"conntrack_ok\": false"));
         assert!(j.contains("\"kill_failed\""));
         assert!(j.contains("\"errors\""));
+        assert!(j.contains("\"last_fresh_uptime_secs\""));
+    }
+
+    #[test]
+    fn prev_status_loads_only_from_this_boot() {
+        let dir = std::env::temp_dir().join(format!("egress-resolver-prev-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let p = dir.join("status.json");
+        std::fs::write(
+            &p,
+            r#"{"schema":2,"boot_id":"b1","answers_uptime_secs":100.5,"last_fresh_uptime_secs":{"rpc.buildernet.org":99.0},"unknown_future_field":1}"#,
+        )
+        .unwrap();
+        let prev = PrevStatus::load(&p, "b1").unwrap();
+        assert_eq!(prev.answers_uptime_secs, Some(100.5));
+        assert_eq!(prev.last_fresh_uptime_secs["rpc.buildernet.org"], 99.0);
+        assert!(PrevStatus::load(&p, "b2").is_none(), "other boot ignored");
+        // older schema without the new fields still loads
+        std::fs::write(&p, r#"{"schema":1,"boot_id":"b1"}"#).unwrap();
+        let prev = PrevStatus::load(&p, "b1").unwrap();
+        assert!(prev.answers_uptime_secs.is_none() && prev.last_fresh_uptime_secs.is_empty());
+        std::fs::write(&p, "not json").unwrap();
+        assert!(PrevStatus::load(&p, "b1").is_none());
+        assert!(PrevStatus::load(&dir.join("missing"), "b1").is_none());
+        std::fs::remove_dir_all(&dir).unwrap();
     }
 }
