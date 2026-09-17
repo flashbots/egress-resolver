@@ -39,9 +39,10 @@ apply unit, which pulls in the resolve unit first) every minute:
    rest of the boot; the zone owner has to keep every hop signed.
 2. **`apply`** (`CAP_NET_ADMIN`, no IP sockets) takes the toggle lock and:
    * ignores answers that are missing, corrupt, older than three intervals, or
-     already applied (same generation time as the last applied answers, i.e.
-     the resolve step produced nothing new), treating every name as
-     transient; the file is opened without following symlinks;
+     already applied (same generation time as the last answers that were
+     actually installed, i.e. the resolve step produced nothing new), treating
+     every name as transient; a file whose update failed is retried on the
+     next run; the file is opened without following symlinks;
    * reads the two dynamic chains back from the kernel (`iptables -S`); the
      `--comment` on each rule records which name produced the address, so the
      kernel is the only state and the tool is stateless. A chain holding
@@ -64,7 +65,7 @@ apply unit, which pulls in the resolve unit first) every minute:
      through the previous `status.json` of the same boot: `last_fresh_uptime_secs`
      per name, which tells a reader how long an endpoint has been running on
      last-known-good addresses, and `applied_answers_uptime_secs`, the
-     generation time of the last applied answers, which is what the
+     generation time of the last installed answers, which is what the
      already-applied check compares against.
 
 Both chains are created empty by the image's `firewall-config` and are jumped

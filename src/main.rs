@@ -291,11 +291,6 @@ fn run_apply(
         prev.applied_answers_uptime_secs,
         &mut errors,
     );
-    // Generation time of the answers most recently applied. Carried forward
-    // when this run applied none, so a file that stops changing is rejected
-    // on every following run, not just the first.
-    let applied_answers_uptime_secs = answers_uptime.or(prev.applied_answers_uptime_secs);
-
     let _lock = sysutil::lock_exclusive(&opts.lock, opts.lock_timeout)
         .map_err(|e| format!("lock {}: {e}", opts.lock.display()))?;
 
@@ -395,6 +390,14 @@ fn run_apply(
         .copied()
         .filter(|ip| !kill_failed.contains(ip))
         .collect();
+
+    // Generation time of the answers most recently *installed*. Advances only
+    // when this run's answers made it into the kernel; after a failed update
+    // the same file is retried on the next run instead of being rejected as
+    // already applied. Carried forward when this run installed none, so a
+    // file that stops changing is rejected on every following run.
+    let applied_answers_uptime_secs =
+        if apply_ok { answers_uptime } else { None }.or(prev.applied_answers_uptime_secs);
 
     // 4. Freshness bookkeeping: when each name's installed addresses last came
     //    from a fresh authenticated answer. Names whose source is fresh in this
@@ -769,6 +772,36 @@ names = ["tx.tee-searcher.flashbots.net"]
             "production must be refused after a failed update"
         );
         assert!(st.added.is_empty() && st.removed.is_empty());
+        assert_eq!(
+            st.applied_answers_uptime_secs, None,
+            "a failed update must not mark its answers as applied"
+        );
+        // second run on the same, still valid file: the update is retried and
+        // B is installed, instead of the file being skipped as already applied
+        let mut ex = FakeExec::default()
+            .respond(0, &chain("P", &[(A, "rpc.buildernet.org")]))
+            .respond(0, &chain("M", &[(A, "rpc.buildernet.org")]))
+            .respond(0, "") // restore succeeds this time
+            .respond(0, &chain("P", &[(B, "rpc.buildernet.org")]))
+            .respond(
+                0,
+                &chain("M", &[(A, "rpc.buildernet.org"), (B, "rpc.buildernet.org")]),
+            )
+            .respond(0, "") // conntrack A (maintenance sweep)
+            .respond(0, ""); // conntrack B
+        let st = run_apply(&h.cfg, &h.opts, &mut ex, 120.0).unwrap();
+        assert!(st.apply_ok && st.required_fresh, "{:?}", st.errors);
+        assert_eq!(
+            ex.calls[2].program,
+            iptables::IPTABLES_RESTORE,
+            "restore retried"
+        );
+        assert_eq!(
+            st.production,
+            vec![B.parse::<std::net::Ipv4Addr>().unwrap()]
+        );
+        assert_eq!(st.applied_answers_uptime_secs, Some(100.0));
+        assert!(h.hosts().contains(&format!("{B} rpc.buildernet.org")));
     }
 
     #[test]

@@ -22,11 +22,12 @@ pub struct Status {
     /// `/proc/uptime` seconds when the DNS answers applied by this run were
     /// produced; `None` if this run had no usable answers.
     pub answers_uptime_secs: Option<f64>,
-    /// `/proc/uptime` seconds when the most recently *applied* answers were
-    /// produced, carried forward across runs that applied none (missing,
-    /// stale, corrupt or already-applied file). The already-applied check
-    /// compares against this, so it keeps working however many runs the
-    /// resolve step stays silent.
+    /// `/proc/uptime` seconds when the most recently *installed* answers were
+    /// produced, carried forward across runs that installed none (missing,
+    /// stale, corrupt or already-applied file, or a failed firewall update,
+    /// which is retried from the same file on the next run). The
+    /// already-applied check compares against this, so it keeps working
+    /// however many runs the resolve step stays silent.
     pub applied_answers_uptime_secs: Option<f64>,
     /// Content of `/etc/searcher-network.state` at apply time.
     pub mode: String,
