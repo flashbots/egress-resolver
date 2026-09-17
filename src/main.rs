@@ -288,9 +288,13 @@ fn run_apply(
     let (answers, answers_uptime) = load_answers(
         &opts.answers,
         now_uptime,
-        prev.answers_uptime_secs,
+        prev.applied_answers_uptime_secs,
         &mut errors,
     );
+    // Generation time of the answers most recently applied. Carried forward
+    // when this run applied none, so a file that stops changing is rejected
+    // on every following run, not just the first.
+    let applied_answers_uptime_secs = answers_uptime.or(prev.applied_answers_uptime_secs);
 
     let _lock = sysutil::lock_exclusive(&opts.lock, opts.lock_timeout)
         .map_err(|e| format!("lock {}: {e}", opts.lock.display()))?;
@@ -411,6 +415,7 @@ fn run_apply(
         boot_id,
         generated_uptime_secs,
         answers_uptime_secs: answers_uptime,
+        applied_answers_uptime_secs,
         mode,
         apply_ok,
         hosts_ok,
@@ -921,6 +926,33 @@ names = ["tx.tee-searcher.flashbots.net"]
         assert!(st
             .to_metrics()
             .contains("egress_resolver_endpoint_fresh_age_seconds{name=\"rpc.buildernet.org\"}"));
+        assert_eq!(st.applied_answers_uptime_secs, Some(100.0));
+        // third run, same file, still under the age limit: the marker must
+        // have survived the rejected run, so the file is rejected again and
+        // the freshness bookkeeping does not reset
+        let mut ex = FakeExec::default()
+            .respond(0, &chain("P", &[(A, "rpc.buildernet.org")]))
+            .respond(0, &chain("M", &[(A, "rpc.buildernet.org")]))
+            .respond(0, "");
+        let st = run_apply(&h.cfg, &h.opts, &mut ex, 180.0).unwrap();
+        assert!(
+            !st.required_fresh,
+            "an unchanged file must not become fresh again"
+        );
+        assert!(
+            st.errors.iter().any(|e| e.contains("already applied")),
+            "{:?}",
+            st.errors
+        );
+        assert_eq!(st.last_fresh_uptime_secs["rpc.buildernet.org"], first_fresh);
+        assert_eq!(st.answers_uptime_secs, None, "no usable answers this run");
+        assert_eq!(
+            st.applied_answers_uptime_secs,
+            Some(100.0),
+            "consumed marker carried across the rejected run"
+        );
+        assert_eq!(h.status_json()["applied_answers_uptime_secs"], 100.0);
+        assert_eq!(ex.calls.len(), 3, "no restore");
     }
 
     #[test]

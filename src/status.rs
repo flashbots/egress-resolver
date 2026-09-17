@@ -19,8 +19,15 @@ pub struct Status {
     /// `/proc/uptime` seconds when this status was written. Readers compare
     /// against the current uptime: monotonic, not host-adjustable.
     pub generated_uptime_secs: f64,
-    /// `/proc/uptime` seconds when the DNS answers were produced, if usable.
+    /// `/proc/uptime` seconds when the DNS answers applied by this run were
+    /// produced; `None` if this run had no usable answers.
     pub answers_uptime_secs: Option<f64>,
+    /// `/proc/uptime` seconds when the most recently *applied* answers were
+    /// produced, carried forward across runs that applied none (missing,
+    /// stale, corrupt or already-applied file). The already-applied check
+    /// compares against this, so it keeps working however many runs the
+    /// resolve step stays silent.
+    pub applied_answers_uptime_secs: Option<f64>,
     /// Content of `/etc/searcher-network.state` at apply time.
     pub mode: String,
     /// The firewall chains hold exactly the planned policy (rewritten, or
@@ -62,7 +69,7 @@ pub struct PrevStatus {
     #[serde(default)]
     pub boot_id: String,
     #[serde(default)]
-    pub answers_uptime_secs: Option<f64>,
+    pub applied_answers_uptime_secs: Option<f64>,
     #[serde(default)]
     pub last_fresh_uptime_secs: BTreeMap<String, f64>,
 }
@@ -226,6 +233,7 @@ mod tests {
             boot_id: "b".into(),
             generated_uptime_secs: 12.5,
             answers_uptime_secs: Some(12.0),
+            applied_answers_uptime_secs: Some(12.0),
             mode: "production".into(),
             apply_ok: true,
             hosts_ok: true,
@@ -301,17 +309,19 @@ mod tests {
         let p = dir.join("status.json");
         std::fs::write(
             &p,
-            r#"{"schema":2,"boot_id":"b1","answers_uptime_secs":100.5,"last_fresh_uptime_secs":{"rpc.buildernet.org":99.0},"unknown_future_field":1}"#,
+            r#"{"schema":2,"boot_id":"b1","answers_uptime_secs":null,"applied_answers_uptime_secs":100.5,"last_fresh_uptime_secs":{"rpc.buildernet.org":99.0},"unknown_future_field":1}"#,
         )
         .unwrap();
         let prev = PrevStatus::load(&p, "b1").unwrap();
-        assert_eq!(prev.answers_uptime_secs, Some(100.5));
+        assert_eq!(prev.applied_answers_uptime_secs, Some(100.5));
         assert_eq!(prev.last_fresh_uptime_secs["rpc.buildernet.org"], 99.0);
         assert!(PrevStatus::load(&p, "b2").is_none(), "other boot ignored");
         // older schema without the new fields still loads
         std::fs::write(&p, r#"{"schema":1,"boot_id":"b1"}"#).unwrap();
         let prev = PrevStatus::load(&p, "b1").unwrap();
-        assert!(prev.answers_uptime_secs.is_none() && prev.last_fresh_uptime_secs.is_empty());
+        assert!(
+            prev.applied_answers_uptime_secs.is_none() && prev.last_fresh_uptime_secs.is_empty()
+        );
         std::fs::write(&p, "not json").unwrap();
         assert!(PrevStatus::load(&p, "b1").is_none());
         assert!(PrevStatus::load(&dir.join("missing"), "b1").is_none());

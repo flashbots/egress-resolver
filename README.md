@@ -39,9 +39,9 @@ apply unit, which pulls in the resolve unit first) every minute:
    rest of the boot; the zone owner has to keep every hop signed.
 2. **`apply`** (`CAP_NET_ADMIN`, no IP sockets) takes the toggle lock and:
    * ignores answers that are missing, corrupt, older than three intervals, or
-     already applied by the previous run (same generation time, i.e. the
-     resolve step produced nothing new), treating every name as transient; the
-     file is opened without following symlinks;
+     already applied (same generation time as the last applied answers, i.e.
+     the resolve step produced nothing new), treating every name as
+     transient; the file is opened without following symlinks;
    * reads the two dynamic chains back from the kernel (`iptables -S`); the
      `--comment` on each rule records which name produced the address, so the
      kernel is the only state and the tool is stateless. A chain holding
@@ -60,10 +60,12 @@ apply unit, which pulls in the resolve unit first) every minute:
      `0 flow entries have been deleted`, since operational errors exit 1 too;
    * writes `status.json` (consumed by `toggle` before entering production) and a
      Prometheus textfile, then exits non-zero if the firewall, hosts or
-     conntrack step failed. The only value carried from one run to the next is
-     `last_fresh_uptime_secs` per name (read back from the previous
-     `status.json` of the same boot), which is what tells a reader how long an
-     endpoint has been running on last-known-good addresses.
+     conntrack step failed. Two values are carried from one run to the next
+     through the previous `status.json` of the same boot: `last_fresh_uptime_secs`
+     per name, which tells a reader how long an endpoint has been running on
+     last-known-good addresses, and `applied_answers_uptime_secs`, the
+     generation time of the last applied answers, which is what the
+     already-applied check compares against.
 
 Both chains are created empty by the image's `firewall-config` and are jumped
 to from static rules, so `iptables-save` remains a complete description of the
@@ -98,7 +100,7 @@ names = ["tx.tee-searcher.flashbots.net"]
 | Path | Writer | Purpose |
 |---|---|---|
 | `/run/egress-resolver/resolve/answers.json` | `resolve` | hand-off to `apply` |
-| `/run/egress-resolver/status.json` | `apply` | mode, per-name state, `apply_ok` / `hosts_ok` / `conntrack_ok`, `required_satisfied`, `required_fresh`, `last_fresh_uptime_secs` per name, `killed` / `kill_failed`, errors; uptime-based timestamps |
+| `/run/egress-resolver/status.json` | `apply` | mode, per-name state, `apply_ok` / `hosts_ok` / `conntrack_ok`, `required_satisfied`, `required_fresh`, `last_fresh_uptime_secs` per name, `applied_answers_uptime_secs`, `killed` / `kill_failed`, errors; uptime-based timestamps |
 | `/run/egress-resolver/metrics/egress-resolver.prom` | `apply` | node-exporter textfile |
 | `/run/flashbox-endpoints/hosts` | `apply` | container `/etc/hosts` target |
 
