@@ -194,9 +194,8 @@ fn cmd_resolve(opts: &Opts) -> Result<(), String> {
 
 fn cmd_apply(opts: &Opts) -> Result<(), String> {
     let cfg = load_config(&opts.config)?;
-    let now = sysutil::uptime_secs().map_err(|e| format!("uptime: {e}"))?;
     let mut exec = SystemExec;
-    let st = run_apply(&cfg, opts, &mut exec, now)?;
+    let st = run_apply(&cfg, opts, &mut exec, &sysutil::uptime_secs)?;
     for e in &st.errors {
         eprintln!("egress-resolver: warning: {e}");
     }
@@ -232,13 +231,16 @@ fn load_answers(
                 now_uptime - a.generated_uptime_secs
             ));
         }
-        Ok(a) if Some(a.generated_uptime_secs) == already_applied_uptime => {
-            // The resolve step did not produce a new file since the previous
-            // run (it died, or apply was started on its own): nothing here is
-            // fresh, however recent the file looks.
+        Ok(a) if already_applied_uptime.is_some_and(|m| a.generated_uptime_secs <= m) => {
+            // Not newer than the last installed generation: either the
+            // resolve step produced nothing new (it died, or apply was started
+            // on its own), or this is an older snapshot than what another run
+            // already installed. Nothing here is fresh, however recent the
+            // file looks.
             errors.push(format!(
-                "answers generated at uptime {:.0}s were already applied by the previous run; treating resolution as failed",
-                a.generated_uptime_secs
+                "answers generated at uptime {:.0}s are not newer than the last installed generation ({:.0}s): already applied or superseded, treating resolution as failed",
+                a.generated_uptime_secs,
+                already_applied_uptime.unwrap_or_default()
             ));
         }
         Ok(a) => {
@@ -280,9 +282,17 @@ fn run_apply(
     cfg: &Config,
     opts: &Opts,
     exec: &mut dyn Exec,
-    now_uptime: f64,
+    clock: &dyn Fn() -> std::io::Result<f64>,
 ) -> Result<status::Status, String> {
     let mut errors: Vec<String> = Vec::new();
+
+    // Everything below happens under the lock shared with `toggle`. The
+    // clock, the previous status and the answers file are read only once it
+    // is held, so a run that waited for another writer never acts on a
+    // snapshot taken before that writer finished.
+    let _lock = sysutil::lock_exclusive(&opts.lock, opts.lock_timeout)
+        .map_err(|e| format!("lock {}: {e}", opts.lock.display()))?;
+    let now_uptime = clock().map_err(|e| format!("uptime: {e}"))?;
     let boot_id = sysutil::boot_id();
     let prev = status::PrevStatus::load(&opts.status, &boot_id).unwrap_or_default();
     let (answers, answers_uptime) = load_answers(
@@ -291,8 +301,6 @@ fn run_apply(
         prev.applied_answers_uptime_secs,
         &mut errors,
     );
-    let _lock = sysutil::lock_exclusive(&opts.lock, opts.lock_timeout)
-        .map_err(|e| format!("lock {}: {e}", opts.lock.display()))?;
 
     let current_prod = iptables::read_chain(exec, &cfg.firewall.production_chain)?;
     let current_maint = iptables::read_chain(exec, &cfg.firewall.maintenance_chain)?;
@@ -403,7 +411,7 @@ fn run_apply(
     //    from a fresh authenticated answer. Names whose source is fresh in this
     //    run (only possible when the update succeeded) get "now"; the rest
     //    carry the previous run's value forward.
-    let generated_uptime_secs = sysutil::uptime_secs().unwrap_or(now_uptime);
+    let generated_uptime_secs = clock().unwrap_or(now_uptime);
     let mut last_fresh_uptime_secs = prev.last_fresh_uptime_secs;
     last_fresh_uptime_secs.retain(|name, _| names.iter().any(|n| &n.name == name));
     for n in names
@@ -672,7 +680,7 @@ names = ["tx.tee-searcher.flashbots.net"]
             ) // verify M
             .respond(1, "0 flow entries have been deleted.") // conntrack A
             .respond(0, ""); // conntrack AP
-        let st = run_apply(&h.cfg, &h.opts, &mut ex, 110.0).unwrap();
+        let st = run_apply(&h.cfg, &h.opts, &mut ex, &|| Ok(110.0)).unwrap();
         assert!(st.all_ok(), "{:?}", st.errors);
         assert!(st.required_satisfied && st.required_fresh);
         assert_eq!(
@@ -706,7 +714,7 @@ names = ["tx.tee-searcher.flashbots.net"]
                 &chain("M", &[(A, "rpc.buildernet.org"), (B, "rpc.buildernet.org")]),
             )
             .respond(0, ""); // conntrack B
-        let st = run_apply(&h.cfg, &h.opts, &mut ex, 110.0).unwrap();
+        let st = run_apply(&h.cfg, &h.opts, &mut ex, &|| Ok(110.0)).unwrap();
         assert!(st.all_ok());
         assert_eq!(st.killed, vec![B.parse::<std::net::Ipv4Addr>().unwrap()]);
         assert_eq!(ex.calls.len(), 3, "unchanged chains: no restore, one kill");
@@ -726,7 +734,7 @@ names = ["tx.tee-searcher.flashbots.net"]
             .respond(0, &chain("P", &[(A, "rpc.buildernet.org")]))
             .respond(0, &chain("M", &[(A, "rpc.buildernet.org")]))
             .respond(0, ""); // conntrack A (maintenance)
-        let st = run_apply(&h.cfg, &h.opts, &mut ex, 110.0).unwrap();
+        let st = run_apply(&h.cfg, &h.opts, &mut ex, &|| Ok(110.0)).unwrap();
         assert!(st.apply_ok && st.hosts_ok);
         assert!(st.errors.iter().any(|e| e.contains("max_addresses")));
         assert!(st.required_satisfied, "rpc keeps its installed address");
@@ -751,7 +759,7 @@ names = ["tx.tee-searcher.flashbots.net"]
             .respond(0, &chain("P", &[(A, "rpc.buildernet.org")])) // re-read P
             .respond(0, &chain("M", &[(A, "rpc.buildernet.org")])) // re-read M
             .respond(0, ""); // conntrack A (maintenance)
-        let st = run_apply(&h.cfg, &h.opts, &mut ex, 110.0).unwrap();
+        let st = run_apply(&h.cfg, &h.opts, &mut ex, &|| Ok(110.0)).unwrap();
         assert!(!st.apply_ok && !st.all_ok());
         assert!(st.hosts_ok);
         let hosts = h.hosts();
@@ -789,7 +797,7 @@ names = ["tx.tee-searcher.flashbots.net"]
             )
             .respond(0, "") // conntrack A (maintenance sweep)
             .respond(0, ""); // conntrack B
-        let st = run_apply(&h.cfg, &h.opts, &mut ex, 120.0).unwrap();
+        let st = run_apply(&h.cfg, &h.opts, &mut ex, &|| Ok(120.0)).unwrap();
         assert!(st.apply_ok && st.required_fresh, "{:?}", st.errors);
         assert_eq!(
             ex.calls[2].program,
@@ -823,7 +831,7 @@ names = ["tx.tee-searcher.flashbots.net"]
             ) // re-read
             .respond(0, &chain("M", &[(A, "rpc.buildernet.org")]))
             .respond(0, "");
-        let st = run_apply(&h.cfg, &h.opts, &mut ex, 110.0).unwrap();
+        let st = run_apply(&h.cfg, &h.opts, &mut ex, &|| Ok(110.0)).unwrap();
         assert!(!st.apply_ok);
         assert!(
             st.errors
@@ -843,7 +851,7 @@ names = ["tx.tee-searcher.flashbots.net"]
             .respond(0, &chain("P", &[(A, "rpc.buildernet.org")]))
             .respond(0, &chain("M", &[(A, "rpc.buildernet.org")]))
             .respond(0, "");
-        let st = run_apply(&h.cfg, &h.opts, &mut ex, 110.0).unwrap();
+        let st = run_apply(&h.cfg, &h.opts, &mut ex, &|| Ok(110.0)).unwrap();
         assert!(st.apply_ok && !st.hosts_ok && !st.all_ok());
         assert!(!st.required_satisfied);
         assert!(st.errors.iter().any(|e| e.contains("hosts")));
@@ -876,7 +884,7 @@ names = ["tx.tee-searcher.flashbots.net"]
             )
             .respond(2, "") // conntrack AP (first in numeric order) fails
             .respond(0, ""); // conntrack A ok
-        let st = run_apply(&h.cfg, &h.opts, &mut ex, 110.0).unwrap();
+        let st = run_apply(&h.cfg, &h.opts, &mut ex, &|| Ok(110.0)).unwrap();
         assert!(st.apply_ok && st.hosts_ok && !st.conntrack_ok && !st.all_ok());
         assert_eq!(
             st.kill_failed,
@@ -898,7 +906,7 @@ names = ["tx.tee-searcher.flashbots.net"]
             .respond(0, &chain("P", &[(A, "rpc.buildernet.org")]))
             .respond(0, &chain("M", &[(A, "rpc.buildernet.org")]))
             .respond(0, "");
-        let st = run_apply(&h.cfg, &h.opts, &mut ex, 110.0).unwrap();
+        let st = run_apply(&h.cfg, &h.opts, &mut ex, &|| Ok(110.0)).unwrap();
         assert!(st.apply_ok && st.required_satisfied && !st.required_fresh);
         assert!(st.errors.iter().any(|e| e.contains("cannot read answers")));
         assert_eq!(st.endpoints[0].source, plan::Source::LastKnownGood);
@@ -908,7 +916,10 @@ names = ["tx.tee-searcher.flashbots.net"]
             .respond(0, &chain("P", &[(A, "rpc.buildernet.org")]))
             .respond(0, &chain("M", &[(A, "rpc.buildernet.org")]))
             .respond(0, "");
-        let st = run_apply(&h.cfg, &h.opts, &mut ex, 100.0 + ANSWERS_MAX_AGE_SECS + 1.0).unwrap();
+        let st = run_apply(&h.cfg, &h.opts, &mut ex, &|| {
+            Ok(100.0 + ANSWERS_MAX_AGE_SECS + 1.0)
+        })
+        .unwrap();
         assert!(
             st.errors.iter().any(|e| e.contains("old")),
             "{:?}",
@@ -933,7 +944,7 @@ names = ["tx.tee-searcher.flashbots.net"]
             .respond(0, &chain("P", &[(A, "rpc.buildernet.org")]))
             .respond(0, &chain("M", &[(A, "rpc.buildernet.org")]))
             .respond(0, ""); // conntrack A
-        let st = run_apply(&h.cfg, &h.opts, &mut ex, 110.0).unwrap();
+        let st = run_apply(&h.cfg, &h.opts, &mut ex, &|| Ok(110.0)).unwrap();
         assert!(st.all_ok() && st.required_fresh);
         assert!(st.last_fresh_uptime_secs.contains_key("rpc.buildernet.org"));
         let first_fresh = st.last_fresh_uptime_secs["rpc.buildernet.org"];
@@ -942,7 +953,7 @@ names = ["tx.tee-searcher.flashbots.net"]
             .respond(0, &chain("P", &[(A, "rpc.buildernet.org")]))
             .respond(0, &chain("M", &[(A, "rpc.buildernet.org")]))
             .respond(0, "");
-        let st = run_apply(&h.cfg, &h.opts, &mut ex, 120.0).unwrap();
+        let st = run_apply(&h.cfg, &h.opts, &mut ex, &|| Ok(120.0)).unwrap();
         assert!(st.all_ok() && st.required_satisfied);
         assert!(!st.required_fresh, "nothing was freshly resolved");
         assert!(
@@ -967,7 +978,7 @@ names = ["tx.tee-searcher.flashbots.net"]
             .respond(0, &chain("P", &[(A, "rpc.buildernet.org")]))
             .respond(0, &chain("M", &[(A, "rpc.buildernet.org")]))
             .respond(0, "");
-        let st = run_apply(&h.cfg, &h.opts, &mut ex, 180.0).unwrap();
+        let st = run_apply(&h.cfg, &h.opts, &mut ex, &|| Ok(180.0)).unwrap();
         assert!(
             !st.required_fresh,
             "an unchanged file must not become fresh again"
@@ -1002,7 +1013,7 @@ names = ["tx.tee-searcher.flashbots.net"]
             .respond(0, &chain("P", &[(A, "rpc.buildernet.org")]))
             .respond(0, &chain("M", &[(A, "rpc.buildernet.org")]))
             .respond(0, ""); // conntrack A
-        let st = run_apply(&h.cfg, &h.opts, &mut ex, 110.0).unwrap();
+        let st = run_apply(&h.cfg, &h.opts, &mut ex, &|| Ok(110.0)).unwrap();
         assert!(st.all_ok(), "{:?}", st.errors);
         assert_eq!(
             ex.calls[2].program,
@@ -1021,7 +1032,7 @@ names = ["tx.tee-searcher.flashbots.net"]
             .respond(0, &chain("P", &[(A, "rpc.buildernet.org")]))
             .respond(0, &chain("M", &[(A, "rpc.buildernet.org")]))
             .respond(0, "");
-        let st = run_apply(&h.cfg, &h.opts, &mut ex, 120.0).unwrap();
+        let st = run_apply(&h.cfg, &h.opts, &mut ex, &|| Ok(120.0)).unwrap();
         assert!(st.apply_ok, "{:?}", st.errors);
         assert_eq!(ex.calls[2].program, iptables::IPTABLES_RESTORE);
     }
@@ -1041,7 +1052,7 @@ names = ["tx.tee-searcher.flashbots.net"]
             .respond(0, &chain("P", &[(A, "rpc.buildernet.org")]))
             .respond(0, &chain("M", &[(A, "rpc.buildernet.org")]))
             .respond(0, "");
-        let st = run_apply(&h.cfg, &h.opts, &mut ex, 110.0).unwrap();
+        let st = run_apply(&h.cfg, &h.opts, &mut ex, &|| Ok(110.0)).unwrap();
         assert!(
             st.errors.iter().any(|e| e.contains("cannot read answers")),
             "{:?}",
@@ -1052,5 +1063,74 @@ names = ["tx.tee-searcher.flashbots.net"]
             vec![A.parse::<std::net::Ipv4Addr>().unwrap()],
             "B from the symlink target must not be applied"
         );
+    }
+
+    #[test]
+    fn generation_older_than_the_installed_marker_is_rejected() {
+        let h = Harness::new("older");
+        h.answers(vec![ok("rpc.buildernet.org", &[A])], 100.0);
+        let mut ex = FakeExec::default()
+            .respond(0, &chain("P", &[]))
+            .respond(0, &chain("M", &[]))
+            .respond(0, "")
+            .respond(0, &chain("P", &[(A, "rpc.buildernet.org")]))
+            .respond(0, &chain("M", &[(A, "rpc.buildernet.org")]))
+            .respond(0, "");
+        let st = run_apply(&h.cfg, &h.opts, &mut ex, &|| Ok(110.0)).unwrap();
+        assert!(st.required_fresh);
+        assert_eq!(st.applied_answers_uptime_secs, Some(100.0));
+        // an older snapshot (still under the age limit) must not roll back
+        h.answers(vec![ok("rpc.buildernet.org", &[B])], 90.0);
+        let mut ex = FakeExec::default()
+            .respond(0, &chain("P", &[(A, "rpc.buildernet.org")]))
+            .respond(0, &chain("M", &[(A, "rpc.buildernet.org")]))
+            .respond(0, "");
+        let st = run_apply(&h.cfg, &h.opts, &mut ex, &|| Ok(120.0)).unwrap();
+        assert!(!st.required_fresh);
+        assert!(
+            st.errors.iter().any(|e| e.contains("not newer")),
+            "{:?}",
+            st.errors
+        );
+        assert_eq!(
+            st.production,
+            vec![A.parse::<std::net::Ipv4Addr>().unwrap()],
+            "older snapshot must not replace the installed policy"
+        );
+        assert_eq!(st.applied_answers_uptime_secs, Some(100.0));
+        assert_eq!(ex.calls.len(), 3, "no restore");
+    }
+
+    #[test]
+    fn status_and_answers_are_read_after_the_lock_is_acquired() {
+        // Another holder (toggle, or a preceding apply) owns the lock while an
+        // apply starts. The answers file is replaced while the apply waits;
+        // the apply must act on the file as it is when the lock is granted.
+        let h = Harness::new("lockorder");
+        h.answers(vec![ok("rpc.buildernet.org", &[A])], 100.0);
+        let guard = sysutil::lock_exclusive(&h.opts.lock, Duration::from_secs(1)).unwrap();
+        let opts = h.opts.clone();
+        let worker = std::thread::spawn(move || {
+            let cfg = Config::parse(CFG).unwrap();
+            let mut ex = FakeExec::default()
+                .respond(0, &chain("P", &[]))
+                .respond(0, &chain("M", &[]))
+                .respond(0, "")
+                .respond(0, &chain("P", &[(B, "rpc.buildernet.org")]))
+                .respond(0, &chain("M", &[(B, "rpc.buildernet.org")]))
+                .respond(0, "");
+            run_apply(&cfg, &opts, &mut ex, &|| Ok(110.0))
+        });
+        std::thread::sleep(Duration::from_millis(500));
+        h.answers(vec![ok("rpc.buildernet.org", &[B])], 105.0);
+        drop(guard);
+        let st = worker.join().unwrap().unwrap();
+        assert_eq!(
+            st.production,
+            vec![B.parse::<std::net::Ipv4Addr>().unwrap()],
+            "the file present when the lock was granted must be the one applied"
+        );
+        assert_eq!(st.applied_answers_uptime_secs, Some(105.0));
+        assert!(st.all_ok() && st.required_fresh, "{:?}", st.errors);
     }
 }

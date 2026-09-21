@@ -37,12 +37,15 @@ apply unit, which pulls in the resolve unit first) every minute:
    chain ends in an unsigned zone never gets a fresh answer (the resolver
    cannot set the AD bit), so it stays on last-known-good addresses for the
    rest of the boot; the zone owner has to keep every hop signed.
-2. **`apply`** (`CAP_NET_ADMIN`, no IP sockets) takes the toggle lock and:
+2. **`apply`** (`CAP_NET_ADMIN`, no IP sockets) takes the toggle lock first
+   and reads everything else (clock, previous status, answers) only once it
+   holds it, so a run that waited for another writer never acts on an older
+   snapshot. It then:
    * ignores answers that are missing, corrupt, older than three intervals, or
-     already applied (same generation time as the last answers that were
-     actually installed, i.e. the resolve step produced nothing new), treating
-     every name as transient; a file whose update failed is retried on the
-     next run; the file is opened without following symlinks;
+     not newer than the last generation that was actually installed (the
+     resolve step produced nothing new, or the file is an older snapshot),
+     treating every name as transient; a file whose update failed is retried
+     on the next run; the file is opened without following symlinks;
    * reads the two dynamic chains back from the kernel (`iptables -S`); the
      `--comment` on each rule records which name produced the address, so the
      kernel is the only state and the tool is stateless. A chain holding
